@@ -1,0 +1,8 @@
+plot:
+  type: file_wise
+  save_path: experiments/plots/mnist/no_shuffle
+files:
+  NAIVE:
+    path: experiments/files/mnist/mt_naive.yaml
+  PRER:
+    path: experiments/files/mnist/mt_prer.yaml

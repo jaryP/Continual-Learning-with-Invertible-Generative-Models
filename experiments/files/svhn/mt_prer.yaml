@@ -1,0 +1,32 @@
+cl_technique_config:
+  name: prer
+  model_type: rnvp
+  z_dim: 10
+  blocks: 1
+  n_levels: 2
+  n_hidden: 0
+  hidden_size: 100
+  autoencoder_epochs: 25
+  generator_epochs: 50
+  rec_loss: mse
+  conditioning_config:
+    type: one_hot
+    dimension: 10
+  weights:
+    er: 10
+train_config:
+  epochs: 20
+  load: Yes
+  save_path: experiments/results/svhn/mt/no_shuffle/prer_rnvp
+  experiments: 5
+  cuda: Yes
+  batch_size: 64
+  save: Yes
+  optimizer: adam
+  lr: 0.001
+cl_config:
+  label_per_task: 2
+  cl_problem: MT
+  shuffle_labels: No
+  regularize: Yes
+  dataset: svhn

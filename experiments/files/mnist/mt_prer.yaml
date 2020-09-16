@@ -1,0 +1,32 @@
+cl_technique_config:
+  name: prer
+  model_type: nf
+  z_dim: 20
+  blocks: 5
+  n_levels: 1
+  hidden_size: 100
+  autoencoder_epochs: 10
+  generator_epochs: 50
+  rec_loss: mse
+  conditioning_config:
+    type: one_hot
+    dimension: 10
+  weights:
+    er: 10
+    l1: 0
+train_config:
+  epochs: 10
+  load: Yes
+  save_path: experiments/results/mnist/mt/no_shuffle/prer
+  experiments: 5
+  cuda: Yes
+  batch_size: 64
+  save: Yes
+  optimizer: adam
+  lr: 0.001
+cl_config:
+  label_per_task: 2
+  cl_problem: MT
+  shuffle_labels: No
+  regularize: Yes
+  dataset: mnist

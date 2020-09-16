@@ -1,0 +1,30 @@
+cl_technique_config:
+  name: prer
+  z_dim: 10
+  blocks: 50
+  n_levels: 1
+  autoencoder_epochs: 50
+  generator_epochs: 50
+  rec_loss: mse
+  conditioning_config:
+    type: one_hot
+    dimension: 10
+  weights:
+    er: 1
+    l1: 0.0001
+train_config:
+  epochs: 5
+  load: Yes
+  save_path: experiments/results/cifar10/mt/no_shuffle/prer_rnvp
+  experiments: 5
+  cuda: Yes
+  batch_size: 128
+  save: Yes
+  optimizer: adam
+  lr: 0.001
+cl_config:
+  label_per_task: 2
+  cl_problem: MT
+  shuffle_labels: No
+  regularize: Yes
+  dataset: cifar10
