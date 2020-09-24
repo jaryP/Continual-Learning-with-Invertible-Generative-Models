@@ -82,7 +82,7 @@ class ExperimentConfig:
     train_config = dict(experiments=1, cuda=True, batch_size=64, epochs=10, load=True, save=True,
                         save_path="results", warm_up_epochs=0)
 
-    cl_technique_config = dict(type='naive')
+    cl_technique_config = dict(name='naive')
     cl_config = dict(cl_problem='sit', label_per_task=2, shuffle_labels=False, dataset='mnist')
 
     def __init__(self, path):

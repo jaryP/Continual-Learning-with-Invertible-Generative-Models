@@ -1,4 +1,6 @@
 import math
+from functools import reduce
+from operator import mul
 
 import torch
 import torch.nn as nn
@@ -324,6 +326,12 @@ class MAF(nn.Module):
     def __init__(self, n_blocks, input_size, hidden_size, n_hidden, conditioning_size=None, activation='relu', input_order='sequential', batch_norm=True):
         super().__init__()
 
+        if isinstance(input_size, (tuple)):
+            # in_dim = reduce(mul, input_size, 1)
+            self.input_dim = input_size
+            input_size = reduce(mul, input_size, 1)
+            self.to_flatten = True
+
         modules = []
         self.input_degrees = None
         for i in range(n_blocks):
@@ -334,11 +342,21 @@ class MAF(nn.Module):
         self.net = FlowSequential(*modules)
 
     def forward(self, x, y=None):
+        if self.to_flatten:
+            x = torch.flatten(x, 1)
+
         return self.net(x, y)
 
     def backward(self, u, y=None):
-        return self.net.backward(u, y)
+        if self.to_flatten:
+            u = torch.flatten(u, 1)
 
+        x, det = self.net.backward(u, y)
+
+        if self.to_flatten:
+            x = x.view((u.size(0),) + self.input_dim)
+
+        return x, det
 
 # class IAF(MAF):
 #     def __init__(self, n_blocks, input_size, hidden_size, n_hidden, conditioning_size=None, activation='relu',

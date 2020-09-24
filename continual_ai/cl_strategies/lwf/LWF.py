@@ -65,7 +65,8 @@ class LearningWithoutForgetting(NaiveMethod):
     #
     #     task.train()
     #     images, labels = task.sample(size=self.memory_size)
-    #
+    #-r cd ..
+    
     #     container.encoder.eval()
     #     container.solver.eval()
     #
@@ -74,7 +75,7 @@ class LearningWithoutForgetting(NaiveMethod):
     #     a = list(zip(images.detach(), predictions.detach()))
     #
     #     self.task_memory.append(a)
-
+    
     def on_task_starts(self, container: Container, *args, **kwargs):
 
         self.task_memory = defaultdict(dict)

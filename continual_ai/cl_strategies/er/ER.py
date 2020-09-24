@@ -67,7 +67,7 @@ class EmbeddingRegularization(NaiveMethod):
 
         task.train()
 
-        images, _ = task.sample(size=self.memorized_task_size)
+        _, images, _ = task.sample(size=self.memorized_task_size)
 
         container.encoder.eval()
 

@@ -35,7 +35,7 @@ class GradientEpisodicMemory(NaiveMethod):
         gem_config = config.cl_technique_config
         self.margin = gem_config.get('margin', 0.5)
         self.task_memory_size = gem_config.get('task_memory_size', 500)
-        self.batch_size = config.train_config['batch_size']
+        self.batch_size = gem_config.get('batch_size', config.train_config['batch_size'])
         self.sample_size = gem_config.get('sample_size', self.task_memory_size)
 
         if random_state is None or isinstance(random_state, int):
@@ -54,7 +54,7 @@ class GradientEpisodicMemory(NaiveMethod):
             logger.info(F'\tBatch size: {self.batch_size}')
 
         self.task_memory = []
-        self.loss_f = nn.CrossEntropyLoss(reduction='sum')
+        self.loss_f = nn.CrossEntropyLoss(reduction='mean')
 
     # def on_task_starts(self, container: Container, *args, **kwargs):
     #     for i in range(container.current_task.index):
@@ -65,11 +65,12 @@ class GradientEpisodicMemory(NaiveMethod):
         task = container.current_task
 
         task.train()
-        images, labels = task.sample(size=self.task_memory_size)
+        _, images, labels = task.sample(size=self.task_memory_size)
 
-        a = list(zip(images.detach(), labels.detach()))
+        # a = list(zip(images.detach(), labels.detach()))
 
-        self.task_memory.append(Sampler(a, dimension=self.sample_size, random_state=self.RandomState))
+        # self.task_memory.append(Sampler(a, dimension=self.sample_size, random_state=self.RandomState))
+        self.task_memory.append((images.detach(), labels.detach()))
 
     def after_back_propagation(self, container: Container, *args, **kwargs):
 
@@ -87,28 +88,39 @@ class GradientEpisodicMemory(NaiveMethod):
             for i, t in enumerate(self.task_memory):
 
                 container.encoder.train()
-                # container.solver.train()
+                container.solver.eval()
 
                 container.encoder.zero_grad()
-                # container.solver.zero_grad()
+                container.solver.zero_grad()
 
                 loss = 0
                 _n = 0
 
-                for b in RandomBatchIterator(t(), batch_size=self.batch_size, random_state=self.RandomState):
+                # for b in RandomBatchIterator(t(), batch_size=self.batch_size, random_state=self.RandomState):
+                #
+                #     image, label = zip(*b)
+                #     image = torch.stack(image)
+                #     label = torch.stack(label)
+                #
+                #     _n += image.shape[0]
+                #
+                #     emb = container.encoder(image)
+                #     o = container.solver(emb, task=i)
+                #
+                #     loss += self.loss_f(o, label)
 
-                    image, label = zip(*b)
-                    image = torch.stack(image)
-                    label = torch.stack(label)
+                image, label = t
+                # image = torch.stack(image)
+                # label = torch.stack(label)
 
-                    _n += image.shape[0]
+                # _n += image.shape[0]
 
-                    emb = container.encoder(image)
-                    o = container.solver(emb, task=i)
+                emb = container.encoder(image)
+                o = container.solver(emb, task=i)
 
-                    loss += self.loss_f(o, label)
+                loss = self.loss_f(o, label)
 
-                loss /= _n
+                # loss /= _n
                 loss.backward()
 
                 gradients = {}
@@ -118,6 +130,8 @@ class GradientEpisodicMemory(NaiveMethod):
 
                 tasks_gradients[i] = deepcopy(gradients)
 
+            container.encoder.zero_grad()
+            container.solver.zero_grad()
             done = False
 
             for n, cg in current_gradients.items():

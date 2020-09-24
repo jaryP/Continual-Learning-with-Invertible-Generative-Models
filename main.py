@@ -1,3 +1,4 @@
+import argparse
 import itertools
 import logging
 import numpy as np
@@ -7,6 +8,7 @@ import os.path
 import torch
 from torch import optim
 import pickle
+from copy import deepcopy
 
 from base import get_dataset, classification_score_on_task, get_predictions, get_model
 from continual_ai.cl_settings import MultiHeadTaskSolver, SingleIncrementalTaskSolver, MultiTask, SingleIncrementalTask
@@ -14,7 +16,7 @@ from continual_ai.cl_strategies import NaiveMethod, ElasticWeightConsolidation, 
     EmbeddingRegularization, LearningWithoutForgetting, Container, PRER
 # from continual_ai.cl_strategies.prer.PRER_custom_nf import PRER
 
-from continual_ai.eval import Accuracy, BackwardTransfer, Evaluator, TotalAccuracy, F1, ExperimentsContainer
+from continual_ai.eval import Accuracy, BackwardTransfer, Evaluator, TotalAccuracy, F1, ExperimentsContainer, TimeMetric
 from continual_ai.utils import ExperimentConfig
 
 
@@ -35,10 +37,16 @@ def my_custom_logger(logger_name, level=logging.INFO):
     return logger
 
 
+parser = argparse.ArgumentParser(description='Main.')
+parser.add_argument('path', action='store', help='The path of the experiment file to load.')
+parser.add_argument('--cuda', '--gpu', action='store', default=-1, help='The gpu to use.', type=int)
+
+args = parser.parse_args()
+
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-experiment_file = sys.argv[1]
+experiment_file = args.path
 
 experiment_config = yaml.load(open(experiment_file), Loader=yaml.FullLoader)
 config = ExperimentConfig(experiment_file)
@@ -81,6 +89,8 @@ for seed in range(config.train_config['experiments']):
 
         continue
 
+    config.train_config['save'] = False
+
     plot_path = os.path.join(experiment_path, 'plots')
     models_path = os.path.join(experiment_path, 'models')
     results_path = os.path.join(experiment_path, 'results')
@@ -96,7 +106,13 @@ for seed in range(config.train_config['experiments']):
 
     logger.info(F'Save path: {experiment_path}.')
 
-    device = 'cuda' if torch.cuda.is_available() and config.train_config['cuda'] else 'cpu'
+    device = 'cpu'
+
+    if torch.cuda.is_available() and args.cuda >= 0 and args.cuda != 'cpu':
+        torch.cuda.set_device(args.cuda)
+        device = 'cuda'
+
+    print('Device {} will be used'.format(device))
 
     dataset_loader, preprocessing, image_channels, image_shape, classes = \
         get_dataset(config.cl_config['dataset'], device)
@@ -115,6 +131,7 @@ for seed in range(config.train_config['experiments']):
     logger.info(F'Continual Learning Strategy: {config.cl_technique_config["name"]}.')
 
     if mn == 'prer':
+        config.train_config['save'] = True
         cl_method = PRER(decoder=decoder, emb_dim=emb_dim, config=config, classes=classes, device=device,
                          plot_dir=plot_path, random_state=rs, logger=logger)
     elif mn == 'naive':
@@ -165,10 +182,14 @@ for seed in range(config.train_config['experiments']):
     container.encoder = encoder
     container.solver = solver
 
-    test_results = Evaluator(classification_metrics=[Accuracy(), F1()], cl_metrics=[BackwardTransfer(), TotalAccuracy()])
-    train_results = Evaluator(classification_metrics=[Accuracy(), F1()], cl_metrics=[BackwardTransfer(), TotalAccuracy()])
+    test_results = Evaluator(classification_metrics=[Accuracy(), F1()],
+                             cl_metrics=[BackwardTransfer(), TotalAccuracy()], other_metrics=TimeMetric())
+    train_results = Evaluator(classification_metrics=[Accuracy(), F1()],
+                              cl_metrics=[BackwardTransfer(), TotalAccuracy()], other_metrics=TimeMetric())
 
     for task in Cl_Dataset:
+
+        train_results.on_task_starts()
 
         task_n = task.index
 
@@ -185,7 +206,6 @@ for seed in range(config.train_config['experiments']):
 
         solver.add_task(len(task.task_labels))
         solver = solver.to(device)
-        # solver.task = task_n
 
         solver.zero_grad()
         encoder.zero_grad()
@@ -198,7 +218,7 @@ for seed in range(config.train_config['experiments']):
                                    lr=lr)
         elif opt == 'sgd':
             optimizer = optim.SGD(itertools.chain(solver.trainable_parameters(task_n), encoder.parameters()),
-                                  lr=lr, momentum=0.9)
+                                  lr=lr)
         else:
             assert False
 
@@ -207,6 +227,9 @@ for seed in range(config.train_config['experiments']):
         cl_method.on_task_starts(container)
 
         task.set_labels_type('task')
+
+        bets_res = 0
+        best_model = (None, None)
 
         for e in range(config.train_config['epochs']):
 
@@ -226,11 +249,11 @@ for seed in range(config.train_config['experiments']):
             task.train()
             task.set_labels_type('task')
 
-            for batch_idx, (_, x, y) in enumerate(task):
+            for batch_idx, (indexes, x, y) in enumerate(task):
                 encoder.train()
                 solver.train()
 
-                container.current_batch = (batch_idx, x, y)
+                container.current_batch = (indexes, x, y)
 
                 cl_method.on_batch_starts(container)
 
@@ -249,7 +272,7 @@ for seed in range(config.train_config['experiments']):
 
                 optimizer.zero_grad()
 
-                loss.backward(retain_graph=True)
+                loss.backward()
 
                 cl_method.after_back_propagation(container)
 
@@ -270,10 +293,12 @@ for seed in range(config.train_config['experiments']):
                 y_true, y_pred = get_predictions(encoder, solver, t)
                 train_results.evaluate(y_true, y_pred, current_task=task.index, evaluated_task=t.index)
 
-            # print(e, 'test', test_results.task_matrix)
-            # print(e, 'train', train_results.task_matrix)
+            if test_results.cl_results()['Accuracy']['TotalAccuracy'] > bets_res:
+                best_model = (solver.state_dict(), decoder.state_dict())
+                bets_res = test_results.cl_results()['Accuracy']['TotalAccuracy']
 
-            print(test_results.cl_results())
+        solver.load_state_dict(best_model[0])
+        decoder.load_state_dict(best_model[1])
 
         cl_method.on_task_ends(container)
 
@@ -294,25 +319,41 @@ for seed in range(config.train_config['experiments']):
 
             torch.save(state, os.path.join(models_path, F'task{task_n}_state.pth'))
 
+        train_results.on_task_ends()
+
         logger.info(F'Training on task #{task_n} over.\n')
 
         logger.info(F'Test split results:')
         print(test_results.cl_results())
+
         for k in test_results.classification_metrics:
             logger.info(F'{k}: \n{test_results.cl_results()[k]}\n{test_results.task_matrix[k]}')
 
         logger.info(F'Train split results:')
         for k in train_results.classification_metrics:
             logger.info(F'{k}: \n{train_results.cl_results()[k]}\n{train_results.task_matrix[k]}')
+
+        otm = train_results.others_metrics_results().items()
+        if len(otm) > 0:
+            logger.info(F'Other metrics train:')
+            for k, v in otm:
+                logger.info(F'{k}: {v}')
+
+        otm = test_results.others_metrics_results().items()
+        if len(otm) > 0:
+            logger.info(F'Other metrics test:')
+            for k, v in otm:
+                logger.info(F'{k}: {v}')
+
         logger.info(F'\n')
 
         final_train.add_evaluator(train_results)
         final_test.add_evaluator(test_results)
 
-    if config.train_config['save']:
-        with open(os.path.join(experiment_path, 'final_results.pkl'), 'wb') as file:
-            pickle.dump({'train': all_train_results[-1], 'test': all_test_results[-1]}, file,
-                        protocol=pickle.HIGHEST_PROTOCOL)
+    # if config.train_config['save']:
+    with open(os.path.join(experiment_path, 'final_results.pkl'), 'wb') as file:
+        pickle.dump({'train': train_results, 'test': test_results}, file,
+                    protocol=pickle.HIGHEST_PROTOCOL)
 
     logger.info('Training process complete.')
 
@@ -320,8 +361,10 @@ print('Final score')
 
 logger = my_custom_logger(os.path.join(base_experiment_path, 'final_score.log'))
 logger.info('Train score:')
+
 # for k in train_results.classification_metrics:
 #     logger.info(F'{k}: \n{train_results.cl_results()[k]}\n{train_results.task_matrix[k]}')
+
 for k, v in final_train.cl_metrics().items():
     logger.info('{}: {}'.format(k, v))
 logger.info('\t{}'.format(final_train.others_metrics()))

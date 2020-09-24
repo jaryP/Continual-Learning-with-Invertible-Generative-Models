@@ -24,6 +24,7 @@ from .student_teacher import StudentTeacher
 from .utils import Conditioner, Prior, modify_batch
 from continual_ai.utils import ExperimentConfig
 from .vae import VAE
+from ...cl_settings import SingleIncrementalTaskSolver
 
 
 class Hook:
@@ -65,6 +66,7 @@ class PRER(NaiveMethod):
         self.config = config
         self.device = device
         self.plot_dir = plot_dir
+
         self.classes = classes
 
         ws = {'old_tasks': 0.5, 'er': 1, 'l1': 0.0001}
@@ -95,11 +97,13 @@ class PRER(NaiveMethod):
 
         assert 0 < self.old_w < 1
 
-        self.base_decoder = deepcopy(decoder)
         self.decoder = decoder
+        self.old_decoder = deepcopy(decoder)
+        self.conditioner = Conditioner(config.cl_technique_config, classes, emb_dim=emb_dim)
+        self.autoencoder_classifier = None
+
         self.emb_dim = emb_dim
 
-        self.conditioner = Conditioner(config.cl_technique_config, classes, emb_dim=emb_dim)
         self.autoencoder_epochs = config.cl_technique_config.get('autoencoder_epochs')
 
         self.model = config.cl_technique_config.get('model_type', 'rnvp').lower()
@@ -110,9 +114,9 @@ class PRER(NaiveMethod):
         self.autoencoder_lr = config.train_config['lr']
         self.z_dim = config.cl_technique_config.get('z_dim', emb_dim)
 
-        # if self.model == 'rnvp':
-        #     self.generator = RNVP(n_levels=self.n_levels, levels_blocks=self.blocks, n_hidden=self.n_hidden,
-        #                           input_dim=emb_dim, conditioning_size=self.conditioner.size, hidden_size=self.hidden_size)
+        # if self.model == 'rnvp': self.generator = RNVP(n_levels=self.n_levels, levels_blocks=self.blocks,
+        # n_hidden=self.n_hidden, input_dim=emb_dim, conditioning_size=self.conditioner.size,
+        # hidden_size=self.hidden_size)
 
         self.generator = self.get_generator()
 
@@ -169,10 +173,10 @@ class PRER(NaiveMethod):
         self.task_labels = []
 
         self.old_generator = None
-        self.old_decoder = None
+        # self.old_decoder = None
         self.old_conditioner = None
 
-        self.plot_path = os.path.join(self.config.train_config['save_path'], 'plots')
+        # self.plot_path = os.path.join(self.config.train_config['save_path'], 'plots')
 
     # def before_gradient_calculation(self, container, *args, **kwargs):
     #     return
@@ -387,9 +391,38 @@ class PRER(NaiveMethod):
 
         emb = container.encoder(images)
         emb = torch.flatten(emb, 1)
-        classifier = torch.nn.Linear(emb.size(1), len(self.all_labels)).to(self.device)
+        # classifier = torch.nn.Linear(emb.size(1), 10).to(self.device)
 
-        autoencoder_opt = Adam(itertools.chain(itertools.chain(self.decoder.parameters(), classifier.parameters(),
+        if self.autoencoder_classifier is None:
+            self.autoencoder_classifier = torch.nn.Linear(emb.size(1), self.classes).to(self.device)
+        #     w = torch.randn((len(self.all_labels), emb.size(1)))
+        #     # torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+        #
+        #     b = torch.rand((len(self.all_labels),))
+        # bound = 1 / np.sqrt(emb.size(1))
+        # torch.nn.init.uniform_(b, -bound, bound)
+
+        # self.autoencoder_classifier = (torch.nn.Parameter(w, requires_grad=True).to(self.device),
+        #                                torch.nn.Parameter(b, requires_grad=True).to(self.device))
+
+        # print(w.is_leaf, torch.nn.Parameter(w, requires_grad=True).is_leaf)
+        # else:
+        #     current_shape = self.autoencoder_classifier[0].shape
+        #
+        #     w = torch.tensor((emb.size(1), len(self.all_labels)), device=self.device) #.to(self.device)
+        #     torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+        #
+        #     b = torch.tensor(len(self.all_labels), device=self.device)#.to(self.device)
+        #     bound = 1 / np.sqrt(emb.size(1))
+        #     torch.nn.init.uniform_(b, -bound, bound)
+        #
+        #     w[:current_shape[0], :current_shape[1]] = self.autoencoder_classifier[0].data
+        #     b[:current_shape[0]] = self.autoencoder_classifier[1].data
+        #
+        #     self.autoencoder_classifier = (torch.nn.Parameter(w, requires_grad=True),
+        #                                    torch.nn.Parameter(b, requires_grad=True))
+
+        autoencoder_opt = Adam(itertools.chain(itertools.chain(self.decoder.parameters(), self.autoencoder_classifier.parameters(),
                                                                container.encoder.parameters())), lr=0.001)
 
         container.current_task.set_labels_type('dataset')
@@ -406,7 +439,7 @@ class PRER(NaiveMethod):
         for e in range(self.autoencoder_epochs):
             tot_sparsity = []
 
-            if e % 5 == 0 and e > 0:
+            if e % 5 == 0 and e > 0 and self.plot_dir is not None:
                 f = self.plot_rec(x_plot, container)
                 f.savefig(os.path.join(self.plot_dir, '{}_rec_images_task{}.png'
                                        .format(e, container.current_task.index)))
@@ -440,15 +473,21 @@ class PRER(NaiveMethod):
                 assert not torch.isnan(emb).any(), 'Emb NaN'
                 assert not torch.isnan(x_rec).any(), 'X_rec NaN'
 
-                cross_entropy = torch.nn.functional.cross_entropy(classifier(torch.flatten(emb, 1)),
+                # pred = torch.nn.functional.linear(torch.flatten(emb, 1),
+                #                                   self.autoencoder_classifier[0], self.autoencoder_classifier[1])
+
+                pred = self.autoencoder_classifier(torch.flatten(emb, 1))
+                cross_entropy = torch.nn.functional.cross_entropy(pred,
                                                                   labels.long(), reduction='none')
 
                 if container.current_task.index > 0:
+                    # mask mette a 0 i valori vecchi e ad 1 quelli  nuovi
+
                     mask = 1 - mask
                     den = mask.sum()
-                    # la maschera mette a zero i valori vecchi e ad 1 quelli  nuovi
+
                     # cross_entropy *= mask
-                    # cross_entropy = cross_entropy.sum() / den
+                    # cross_entropy = cross_entropy.sum() / mask.sum()
 
                     if den > 0:
                         dis_reg = torch.sub(1.0, torch.nn.functional.cosine_similarity(torch.flatten(emb, 1),
@@ -472,9 +511,10 @@ class PRER(NaiveMethod):
 
                 # loss = rec_loss + dis_reg * self.er + l1_loss * self.l1 + cross_entropy  # pred_loss * gamma[e]
                 loss = rec_loss + cross_entropy + dis_reg * self.er + l1_loss * self.l1
+                # print(loss)
                 # tot_sparsity.extend(torch.abs(emb).sum(-1).tolist())
-                if container.current_task.index > 0:
-                    print(rec_loss.item(), cross_entropy.item(), dis_reg.item(), self.er, l1_loss.item())
+                # if container.current_task.index > 0:
+                #     print(rec_loss.item(), cross_entropy.item(), dis_reg.item(), self.er, l1_loss.item())
 
                 # bs = images.shape[0]
                 #
@@ -500,9 +540,8 @@ class PRER(NaiveMethod):
         for h in hooks:
             h.close()
 
-        f = self.plot_rec(x_plot, container)
-        f.savefig(os.path.join(self.plot_dir, 'reconstructed_images_task{}.png'.format(container.current_task.index)))
-        plt.close(f)
+        # if self.plot_dir is not None: f = self.plot_rec(x_plot, container) f.savefig(os.path.join(self.plot_dir,
+        # 'reconstructed_images_task{}.png'.format(container.current_task.index))) plt.close(f)
 
         for param in container.encoder.parameters():
             param.requires_grad = False
@@ -520,51 +559,42 @@ class PRER(NaiveMethod):
             if isinstance(m, torch.nn.ReLU):  # or isinstance(m, torch.nn.Conv2d):
                 self.hooks.append(Hook(m))
 
-        # self.autoencoder_opt = Adam(itertools.chain(self.decoder.parameters()), lr=0.001)
-
         self._t2d[container.current_task.index] = dl
 
         self.all_labels.extend(container.current_task.task_labels)
-        # print(self.all_labels, self.old_labels)
 
         self.autoencoder_training(container)
 
-        self.old_decoder = deepcopy(self.decoder)
+        # self.old_decoder = deepcopy(self.decoder)
+        self.old_decoder.load_state_dict(self.decoder.state_dict())
         self.old_decoder.eval()
 
-        # if self.model in ['rnvp', 'maf']:
-        # self.nf_training(container)
-
-        # for h in self.hooks:
-        #     h.close()
-
-        # elif self.model == 'gan':
-        #     self.gan_training(container)
-        # elif self.model == 'vae':
-        #     self.vae_training(container)
-        # elif self.model == 'st':
-        #     self.st_training(container)
-
-    def on_task_ends(self, container: Container, *args, **kwargs):
         for h in self.hooks:
             h.close()
 
-        self.autoencoder_opt = None
-        _, x_plot, _ = container.current_batch
-        f = self.plot_rec(x_plot, container)
-        f.savefig(os.path.join(self.plot_dir, 'rec_images_task{}_{}.png'
-                               .format(container.current_task.index, 'final')))
-        plt.close(f)
+    def on_task_ends(self, container: Container, *args, **kwargs):
+
+        if self.plot_dir is not None:
+            _, x_plot, _ = container.current_batch
+            f = self.plot_rec(x_plot, container)
+            f.savefig(os.path.join(self.plot_dir, 'rec_images_task{}_{}.png'
+                                   .format(container.current_task.index, 'final')))
+            plt.close(f)
 
         self.nf_training(container)
 
-    # def on_epoch_ends(self, container: Container,  *args, **kwargs):
-    #     if container.current_epoch % 5 == 0:
-    #         _, x_plot, _ = container.current_batch
-    #         f = self.plot_rec(x_plot, container)
-    #         f.savefig(os.path.join(self.plot_dir, 'rec_images_task{}_{}.png'
-    #                                .format(container.current_task.index, container.current_epoch)))
-    #         plt.close(f)
+        old_nf = self.get_generator()
+
+        old_nf.load_state_dict(self.generator.state_dict())
+
+        self.old_generator = old_nf.to(self.device)
+
+        self.old_conditioner = deepcopy(self.conditioner)
+
+        self.old_generator.eval()
+
+        self.old_labels.extend(container.current_task.dataset_labels)
+        self.task_labels.append(container.current_task.dataset_labels)
 
     def plot(self, labels=None):
         if labels is None:
@@ -670,198 +700,6 @@ class PRER(NaiveMethod):
 
         return f
 
-    # def plot_embs(self, container):
-
-    # def autoencoder_training(self, container):
-    #
-    #     # for param in container.encoder.parameters():
-    #     #     param.requires_grad = True
-    #
-    #     # if self.config.cl_config['dataset'] in ['mnist', 'kmnist']:
-    #     #     autoencoder_opt = SGD(itertools.chain(self.decoder.parameters(),
-    #     #                                           container.encoder.parameters()), lr=0.1, momentum=0.9)
-    #     # else:
-    #     #     autoencoder_opt = Adam(itertools.chain(self.decoder.parameters(),
-    #     #                                            container.encoder.parameters()), lr=0.001)
-    #
-    #     # container.current_task.set_labels_type('dataset')
-    #
-    #     # container.current_task.train()
-    #
-    #     # hooks = []
-    #     # for n, m in itertools.chain(self.decoder.named_modules(), container.encoder.named_modules()):
-    #     #     if isinstance(m, torch.nn.ReLU):  # or isinstance(m, torch.nn.Conv2d):
-    #     #         hooks.append(Hook(m))
-    #
-    #     # _, x_plot, y_plot = container.current_task.sample(size=self.train_batch_size)
-    #
-    #     _, images, labels = container.current_batch
-    #
-    #     with torch.no_grad():
-    #         if container.current_task.index > 0:
-    #             zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #             images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #                                                                 self.old_generator,
-    #                                                                 self.old_labels,
-    #                                                                 prior=self.prior,
-    #                                                                 conditioner=self.old_conditioner,
-    #                                                                 zero_prob=zero_prob,
-    #                                                                 return_mask_embeddings=True)
-    #
-    #             # if e == 0 and i == 0:
-    #             #     x_plot = images
-    #
-    #     self.decoder.train()
-    #     # container.encoder.train()
-    #
-    #     emb = container.encoder(images)
-    #
-    #     x_rec = self.decoder(emb)
-    #
-    #     dis_reg = torch.tensor(0, dtype=torch.float)
-    #
-    #     assert not torch.isnan(images).any(), 'Sampled Images NaN'
-    #     assert not torch.isnan(emb).any(), 'Emb NaN'
-    #     assert not torch.isnan(x_rec).any(), 'X_rec NaN'
-    #
-    #     if container.current_task.index > 0:
-    #         den = mask.sum()
-    #         if den > 0:
-    #             mask = 1 - mask
-    #             dis_reg = 1 - torch.nn.functional.cosine_similarity(emb, old_embeddings, dim=-1, eps=1e-4)
-    #             dis_reg = dis_reg * mask
-    #             dis_reg = dis_reg.sum() / den
-    #
-    #         assert not torch.isnan(dis_reg).any(), 'dis_reg Images NaN'
-    #
-    #     rec_loss = self.rec_loss(x_rec, images) / images.size(0)
-    #
-    #     # rec_loss = reconstruction_loss(x_rec, images).sum() / images.size(0)
-    #
-    #     l1_loss = 0
-    #     for h in self.hooks:
-    #         l1_loss += torch.abs(h.output).sum() / images.size(0)
-    #
-    #     l1_loss = torch.div(l1_loss, len(self.hookshooks))
-    #
-    #     loss = rec_loss + dis_reg * self.er + l1_loss * self.l1  # pred_loss * gamma[e]
-    #
-    #     container.current_loss += loss
-    #
-    #     # print(loss)
-    #     # tot_sparsity.extend(torch.abs(emb).sum(-1).tolist())
-    #
-    #     # bs = images.shape[0]
-    #     #
-    #     # images = images.view((bs, -1))
-    #     # x_rec = x_rec.view((bs, -1))
-    #     #
-    #     # d1 = torch.mm(images, images.t())
-    #     # d2 = torch.mm(x_rec, x_rec.t())
-    #     #
-    #     # # reg_loss = torch.nn.functional.mse_loss(d1, d2)
-    #     # reg_loss = ((d1 - d2)**2).mean(1)
-    #     #
-    #     # print(reg_loss.mean())
-    #     # # reg_loss = torch.nn.functional.pdist(images.view(bs, -1) - x_rec.view(bs, -1))
-    #     # loss += reg_loss.mean() * 0.001
-    #
-    #     # autoencoder_opt.zero_grad()
-    #     # loss.backward()
-    #     # autoencoder_opt.step()
-    #
-    #     # for e in range(self.autoencoder_epochs):
-    #     #     tot_sparsity = []
-    #     #
-    #     #     if e % 5 == 0 and e > 0:
-    #     #         f = self.plot_rec(x_plot, container)
-    #     #         f.savefig(os.path.join(self.plot_dir, '{}_rec_images_task{}.png'
-    #     #                                .format(e, container.current_task.index)))
-    #     #         plt.close(f)
-    #     #
-    #     #     for i, (_, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-    #     #         with torch.no_grad():
-    #     #             if container.current_task.index > 0:
-    #     #                 zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #     #                 images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #     #                                                                     self.old_generator,
-    #     #                                                                     self.old_labels,
-    #     #                                                                     prior=self.prior,
-    #     #                                                                     conditioner=self.old_conditioner,
-    #     #                                                                     zero_prob=zero_prob,
-    #     #                                                                     return_mask_embeddings=True)
-    #     #
-    #     #                 if e == 0 and i == 0:
-    #     #                     x_plot = images
-    #     #
-    #     #         self.decoder.train()
-    #     #         container.encoder.train()
-    #     #
-    #     #         emb = container.encoder(images)
-    #     #
-    #     #         x_rec = self.decoder(emb)
-    #     #
-    #     #         dis_reg = torch.tensor(0, dtype=torch.float)
-    #     #
-    #     #         assert not torch.isnan(images).any(), 'Sampled Images NaN'
-    #     #         assert not torch.isnan(emb).any(), 'Emb NaN'
-    #     #         assert not torch.isnan(x_rec).any(), 'X_rec NaN'
-    #     #
-    #     #         if container.current_task.index > 0:
-    #     #             den = mask.sum()
-    #     #             if den > 0:
-    #     #                 mask = 1 - mask
-    #     #                 dis_reg = 1 - torch.nn.functional.cosine_similarity(emb, old_embeddings, dim=-1, eps=1e-4)
-    #     #                 dis_reg = dis_reg * mask
-    #     #                 dis_reg = dis_reg.sum() / den
-    #     #
-    #     #             assert not torch.isnan(dis_reg).any(), 'dis_reg Images NaN'
-    #     #
-    #     #         rec_loss = self.rec_loss(x_rec, images) / images.size(0)
-    #     #
-    #     #         # rec_loss = reconstruction_loss(x_rec, images).sum() / images.size(0)
-    #     #
-    #     #         l1_loss = 0
-    #     #         for h in hooks:
-    #     #             l1_loss += torch.abs(h.output).sum() / images.size(0)
-    #     #
-    #     #         l1_loss = torch.div(l1_loss, len(hooks))
-    #     #
-    #     #         loss = rec_loss + dis_reg * self.er + l1_loss * self.l1  # pred_loss * gamma[e]
-    #     #         # print(loss)
-    #     #         tot_sparsity.extend(torch.abs(emb).sum(-1).tolist())
-    #     #
-    #     #         # bs = images.shape[0]
-    #     #         #
-    #     #         # images = images.view((bs, -1))
-    #     #         # x_rec = x_rec.view((bs, -1))
-    #     #         #
-    #     #         # d1 = torch.mm(images, images.t())
-    #     #         # d2 = torch.mm(x_rec, x_rec.t())
-    #     #         #
-    #     #         # # reg_loss = torch.nn.functional.mse_loss(d1, d2)
-    #     #         # reg_loss = ((d1 - d2)**2).mean(1)
-    #     #         #
-    #     #         # print(reg_loss.mean())
-    #     #         # # reg_loss = torch.nn.functional.pdist(images.view(bs, -1) - x_rec.view(bs, -1))
-    #     #         # loss += reg_loss.mean() * 0.001
-    #     #
-    #     #         autoencoder_opt.zero_grad()
-    #     #         loss.backward()
-    #     #         autoencoder_opt.step()
-    #     #
-    #     #     # print(e, np.mean(tot_sparsity))
-    #     #
-    #     # for h in hooks:
-    #     #     h.close()
-    #     #
-    #     # f = self.plot_rec(x_plot, container)
-    #     # f.savefig(os.path.join(self.plot_dir, 'reconstructed_images_task{}.png'.format(container.current_task.index)))
-    #     # plt.close(f)
-    #     #
-    #     # for param in container.encoder.parameters():
-    #     #     param.requires_grad = False
-
     def nf_training(self, container: Container):
 
         container.encoder.eval()
@@ -874,7 +712,7 @@ class PRER(NaiveMethod):
         #         m.to(self.device)
 
         inn_optimizer = torch.optim.Adam(itertools.chain(self.generator.parameters(),
-                                                         self.conditioner.parameters()), lr=1e-4, weight_decay=1e-5)
+                                                         self.conditioner.parameters()), lr=1e-3, weight_decay=1e-5)
 
         container.current_task.set_labels_type('dataset')
         # to_plot = []
@@ -898,7 +736,7 @@ class PRER(NaiveMethod):
 
         for e in range(self.generator_epochs):
             # print(e)
-            if e % 5 == 0:
+            if e % 5 == 0 and self.plot_dir is not None:
                 f = self.plot(to_plot)
                 f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}_{}.png'
                                        .format(container.current_task.index, e)))
@@ -963,378 +801,18 @@ class PRER(NaiveMethod):
 
             # scheduler.step(lp)
 
-            print(lp, loss.item(), log_det.mean().item(), log_prob.mean().item(), u.mean().item(), u.std().item(), lp)
+            # print(lp, loss.item(), log_det.mean().item(), log_prob.mean().item(), u.mean().item(), u.std().item(), lp)
 
         container.current_task.set_labels_type('task')
 
-        self.old_labels.extend(container.current_task.dataset_labels)
-        self.task_labels.append(container.current_task.dataset_labels)
-
-        f = self.plot()
-        f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}_final.png'.format(container.current_task.index)))
-        plt.close(f)
+        if self.plot_dir is not None:
+            f = self.plot()
+            f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}_final.png'.format(container.current_task.index)))
+            plt.close(f)
 
         # self.generator.load_state_dict(best_model_dict)
 
-        old_nf = self.get_generator()
-
-        old_nf.load_state_dict(self.generator.state_dict())
-
-        self.old_generator = old_nf.to(self.device)
-
-        self.old_conditioner = deepcopy(self.conditioner)
-
-        self.old_generator.eval()
-
-    # def gan_training(self, container: Container):
-    #
-    #     container.encoder.eval()
-    #
-    #     optimizerD = optim.Adam(self.generator.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    #     optimizerG = optim.Adam(self.generator.generator.parameters(), lr=0.001, betas=(0.5, 0.999))
-    #     criterion = torch.nn.BCELoss()
-    #     container.current_task.set_labels_type('task')
-    #
-    #     real_label = 1
-    #     fake_label = 0
-    #
-    #     for e in range(self.generator_epochs):
-    #         if e % 5 == 0:
-    #             f = self.plot(container.current_task.dataset_labels)
-    #             f.savefig(os.path.join(self.plot_dir, '{}_sampled_images_task{}.png'
-    #                                    .format(e, container.current_task.index)))
-    #             plt.close(f)
-    #
-    #         for i, (_, images, labels) in enumerate(container.current_task):
-    #             with torch.no_grad():
-    #                 if container.current_task.index > 0:
-    #                     zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #                     images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #                                                                         self.old_generator,
-    #                                                                         self.old_labels,
-    #                                                                         conditioner=self.old_conditioner,
-    #                                                                         zero_prob=zero_prob,
-    #                                                                         prior=self.prior,
-    #                                                                         return_mask_embeddings=True)
-    #                 emb = container.encoder(images)
-    #
-    #         b_size = images.shape[0]
-    #
-    #         ############################
-    #         # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-    #         ###########################
-    #
-    #         ## Train with all-real batch
-    #         optimizerD.zero_grad()
-    #
-    #         label = torch.full((b_size,), real_label, device=images.device)
-    #         # Forward pass real batch through D
-    #         output = self.generator.D(emb, y=self.conditioner(labels.long())).view(-1)
-    #         # Calculate loss on all-real batch
-    #         errD_real = criterion(output, label)
-    #         # Calculate gradients for D in backward pass
-    #         errD_real.backward()
-    #
-    #         ## Train with all-fake batch
-    #
-    #         noise = self.prior.sample(b_size)
-    #         # Generate fake image batch with G
-    #         fake = self.generator.G(noise, y=self.conditioner(labels.long()))
-    #         label.fill_(fake_label)
-    #         # Classify all fake batch with D
-    #         output = self.generator.D(fake.detach()).view(-1)
-    #         # Calculate D's loss on the all-fake batch
-    #         errD_fake = criterion(output, label)
-    #         # Calculate the gradients for this batch
-    #         errD_fake.backward()
-    #         # Update D
-    #         optimizerD.step()
-    #
-    #         ############################
-    #         # (2) Update G network: maximize log(D(G(z)))
-    #         ###########################
-    #         optimizerG.zero_grad()
-    #         label.fill_(real_label)  # fake labels are real for generator cost
-    #         # Since we just updated D, perform another forward pass of all-fake batch through D
-    #         output = self.generator.D(fake).view(-1)
-    #         # Calculate G's loss based on this output
-    #         errG = criterion(output, label)
-    #         # Calculate gradients for G
-    #         errG.backward()
-    #         # Update G
-    #         optimizerG.step()
-    #
-    #     # for e in range(self.generator_epochs):
-    #     #     if e % 5 == 0:
-    #     #         f = self.plot(container.current_task.dataset_labels)
-    #     #         f.savefig(os.path.join(self.plot_dir, '{}_sampled_images_task{}.png'
-    #     #                                .format(e, container.current_task.index)))
-    #     #         plt.close(f)
-    #     #
-    #     #     for i, (_, images, labels) in enumerate(container.current_task):
-    #     #         with torch.no_grad():
-    #     #             if container.current_task.index > 0:
-    #     #                 zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #     #                 images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #     #                                                                     self.old_generator,
-    #     #                                                                     self.old_labels,
-    #     #                                                                     conditioner=self.old_conditioner,
-    #     #                                                                     zero_prob=zero_prob,
-    #     #                                                                     prior=self.prior,
-    #     #                                                                     return_mask_embeddings=True)
-    #     #             emb = container.encoder(images)
-    #     #
-    #     #         self.generator.train()
-    #     #         self.prior.train()
-    #     #         self.conditioner.train()
-    #     #
-    #     #         u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
-    #     #
-    #     #         log_prob = -torch.mean(log_det + self.prior.log_prob(u).sum(1))
-    #     #
-    #     #         inn_optimizer.zero_grad()
-    #     #         log_prob.backward()
-    #     #
-    #     #         inn_optimizer.step()
-    #
-    #     container.current_task.set_labels_type('task')
-    #
-    #     self.old_labels.extend(container.current_task.dataset_labels)
-    #     self.task_labels.append(container.current_task.dataset_labels)
-    #
-    #     f = self.plot()
-    #     f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}.png'.format(container.current_task.index)))
-    #     plt.close(f)
-    #
-    #     old_generator = deepcopy(self.generator)
-    #
-    #     # old_nf.load_state_dict(self.generator.state_dict())
-    #
-    #     self.old_generator = old_generator.to(self.device)
-    #
-    #     self.old_decoder = deepcopy(self.decoder)
-    #
-    #     self.old_conditioner = deepcopy(self.conditioner)
-    #
-    #     self.old_generator.eval()
-    #     self.old_decoder.eval()
-    #
-    # def vae_training(self, container: Container):
-    #
-    #     container.encoder.eval()
-    #
-    #     # self.generator = self.get_generator()
-    #
-    #     inn_optimizer = torch.optim.Adam(itertools.chain(self.generator.parameters(),
-    #                                                      self.conditioner.parameters()), lr=1e-3, weight_decay=1e-5)
-    #     container.current_task.set_labels_type('dataset')
-    #
-    #     for e in range(self.generator_epochs):
-    #         print(e)
-    #         if e % 5 == 0 and e > 0:
-    #             f = self.plot(container.current_task.dataset_labels)
-    #             f.savefig(os.path.join(self.plot_dir, '{}_sampled_images_task{}.png'
-    #                                    .format(e, container.current_task.index)))
-    #             plt.close(f)
-    #
-    #         for i, (_, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-    #             if i == 0:
-    #                 print('prima', Counter(labels.tolist()))
-    #
-    #             with torch.no_grad():
-    #                 if container.current_task.index > 0:
-    #                     zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #                     images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #                                                                         self.old_generator,
-    #                                                                         self.old_labels,
-    #                                                                         conditioner=self.old_conditioner,
-    #                                                                         zero_prob=zero_prob,
-    #                                                                         prior=self.prior,
-    #                                                                         return_mask_embeddings=True)
-    #                     if i == 0:
-    #                         print('Dopo', Counter(labels.tolist()))
-    #
-    #                 emb = container.encoder(images)
-    #
-    #             self.generator.train()
-    #             self.prior.train()
-    #             self.conditioner.train()
-    #
-    #             emb_hat, mu, logvar = self.generator(emb, self.conditioner(labels.long()))
-    #
-    #             rec = torch.nn.functional.mse_loss(emb_hat, emb)
-    #             kdl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    #
-    #             # u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
-    #
-    #             # log_prob = -torch.mean(log_det + self.prior.log_prob(u).sum(1))
-    #             loss = rec + 0.1 * kdl
-    #
-    #             inn_optimizer.zero_grad()
-    #             loss.backward()
-    #
-    #             inn_optimizer.step()
-    #
-    #     # for param in container.encoder.parameters():
-    #     #     param.requires_grad = False
-    #
-    #     container.current_task.set_labels_type('task')
-    #
-    #     self.old_labels.extend(container.current_task.dataset_labels)
-    #     self.task_labels.append(container.current_task.dataset_labels)
-    #
-    #     f = self.plot()
-    #     f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}.png'.format(container.current_task.index)))
-    #     plt.close(f)
-    #
-    #     old_nf = self.get_generator()
-    #
-    #     old_nf.load_state_dict(self.generator.state_dict())
-    #
-    #     self.old_generator = old_nf.to(self.device)
-    #
-    #     self.old_decoder = deepcopy(self.decoder)
-    #
-    #     self.old_conditioner = deepcopy(self.conditioner)
-    #
-    #     self.old_generator.eval()
-    #     self.old_decoder.eval()
-    #
-    # def st_training(self, container: Container):
-    #
-    #     container.encoder.eval()
-    #
-    #     inn_optimizer = torch.optim.Adam(itertools.chain(self.generator.teacher.parameters(),
-    #                                                      self.conditioner.parameters()), lr=1e-3, weight_decay=1e-5)
-    #     container.current_task.set_labels_type('dataset')
-    #
-    #     # to_plot = list(itertools.chain(*self.task_labels, container.current_task.dataset_labels))
-    #
-    #     for e in range(self.generator_epochs):
-    #         for i, (_, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-    #             with torch.no_grad():
-    #                 if container.current_task.index > 0:
-    #                     zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #                     images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #                                                                         self.old_generator,
-    #                                                                         self.old_labels,
-    #                                                                         conditioner=self.old_conditioner,
-    #                                                                         zero_prob=zero_prob,
-    #                                                                         prior=self.prior,
-    #                                                                         return_mask_embeddings=True)
-    #                 emb = container.encoder(images)
-    #
-    #             self.generator.train()
-    #             self.prior.train()
-    #             self.conditioner.train()
-    #
-    #             u, log_det = self.generator.teacher(
-    #                 emb.detach(),
-    #                 y=self.conditioner(labels.long()))
-    #
-    #             log_prob = -torch.mean(log_det.sum(1) + self.prior.log_prob(u).sum(1))
-    #
-    #             inn_optimizer.zero_grad()
-    #             log_prob.backward()
-    #
-    #             inn_optimizer.step()
-    #
-    #     inn_optimizer = torch.optim.Adam(itertools.chain(self.generator.student.parameters()), lr=1e-3,
-    #                                      weight_decay=1e-5)
-    #     container.current_task.set_labels_type('dataset')
-    #
-    #     to_plot = list(itertools.chain(*self.task_labels, container.current_task.dataset_labels))
-    #
-    #     # with torch.autograd.set_detect_anomaly(True):
-    #     for e in range(self.generator_epochs):
-    #         if e % 5 == 0 and e > 0:
-    #             f = self.plot(to_plot)
-    #             f.savefig(os.path.join(self.plot_dir, '{}_sampled_images_task{}.png'
-    #                                    .format(e, container.current_task.index)))
-    #             plt.close(f)
-    #
-    #         for i, (_, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-    #             with torch.no_grad():
-    #                 if container.current_task.index > 0:
-    #                     zero_prob = len(self.old_labels) / (len(self.all_labels))
-    #                     images, labels, mask, old_embeddings = modify_batch(images, labels, self.old_decoder,
-    #                                                                         self.old_generator,
-    #                                                                         self.old_labels,
-    #                                                                         conditioner=self.old_conditioner,
-    #                                                                         zero_prob=zero_prob,
-    #                                                                         prior=self.prior,
-    #                                                                         return_mask_embeddings=True)
-    #                 # emb = container.encoder(images)
-    #
-    #             self.generator.train()
-    #             self.prior.train()
-    #             self.conditioner.train()
-    #
-    #             u = self.prior.sample(images.shape[0])
-    #
-    #             x, log_det = self.generator.student(u, y=self.conditioner(labels.long()))
-    #             log_prob_student = log_det + self.prior.log_prob(u)
-    #             prob_student = log_prob_student.exp().softmax(-1)
-    #
-    #             u_hat, log_det = self.generator.teacher(x, y=self.conditioner(labels.long()))
-    #             log_prob_teacher = log_det + self.prior.log_prob(u_hat)
-    #             prob_teacher = log_prob_teacher.exp().softmax(-1)
-    #
-    #             # kl = (prob_student * (prob_student/prob_teacher)).sum(1)
-    #             #
-    #             # kl = kl.mean()
-    #             # h_ps = -log_prob_student.mean()
-    #             #
-    #             # log_prob_student = log_prob_student.exp()
-    #             # log_prob_teacher = log_prob_teacher.exp()
-    #             #
-    #             # h_ps_pt = torch.nn.functional.cross_entropy(log_prob_student, log_prob_teacher)
-    #             #
-    #             # kl = h_ps + h_ps_pt
-    #
-    #             # kl = log_prob_student - log_prob_teacher
-    #             # kl = kl.mean(0)
-    #             # kl = (prob_teacher*(a2.log()-a1.log())).sum(1).mean()
-    #             kl = torch.nn.functional.kl_div(prob_student.log(), prob_teacher, reduction='batchmean')
-    #             print(kl)
-    #
-    #             if kl == 0:
-    #                 break
-    #
-    #             # u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
-    #
-    #             inn_optimizer.zero_grad()
-    #             kl.backward()
-    #
-    #             inn_optimizer.step()
-    #
-    #     container.current_task.set_labels_type('task')
-    #
-    #     self.old_labels.extend(container.current_task.dataset_labels)
-    #     self.task_labels.append(container.current_task.dataset_labels)
-    #
-    #     f = self.plot()
-    #     f.savefig(os.path.join(self.plot_dir, 'sampled_images_task{}.png'.format(container.current_task.index)))
-    #     plt.close(f)
-    #
-    #     old_nf = self.get_generator()
-    #
-    #     old_nf.load_state_dict(self.generator.state_dict())
-    #
-    #     self.old_generator = old_nf.to(self.device)
-    #
-    #     self.old_decoder = deepcopy(self.decoder)
-    #
-    #     self.old_conditioner = deepcopy(self.conditioner)
-    #
-    #     self.old_generator.eval()
-    #     self.old_decoder.eval()
-
     def get_generator(self):
-        # if self.model == 'nf':
-        # gen = RNVP(n_levels=self.n_levels, levels_blocks=self.blocks, n_hidden=self.n_hidden,
-        #            input_dim=self.emb_dim, conditioning_size=self.conditioner.size,
-        #            hidden_size=self.hidden_size)
 
         cf = get_f(hidden_dim_channel=2.0, hidden_dim_width=2.0, hidden_layers_width=1,
                    hidden_layers_channel=1,
@@ -1346,20 +824,5 @@ class PRER(NaiveMethod):
         gen = ChannelWiseNF(n_levels=self.n_levels, levels_blocks=self.blocks, input_dim=self.emb_dim,
                             coupling_f=cf,
                             gaussianize_f=gf, conditioning_size=self.conditioner.size).cuda()
-
-        # elif self.model == 'gan':
-        #     gen = DCGAN(emb_size=self.emb_dim, hidden_dimension=self.hidden_size, depth=self.n_levels,
-        #                 cond_dim=self.conditioner.size, z_dim=self.z_dim)
-        # elif self.model == 'maf':
-        #     gen = MAF(n_blocks=self.blocks, input_size=self.emb_dim, conditioning_size=self.conditioner.size,
-        #               n_hidden=self.n_hidden, hidden_size=self.hidden_size, batch_norm=True)
-        # elif self.model == 'vae':
-        #     gen = VAE(input_size=self.emb_dim, conditioning_size=self.conditioner.size,
-        #               n_hidden=self.n_hidden, z_dim=self.z_dim)
-        # elif self.model == 'st':
-        #     gen = StudentTeacher(n_blocks=self.blocks, input_size=self.emb_dim, conditioning_size=self.conditioner.size,
-        #                          n_hidden=self.n_hidden, hidden_size=self.hidden_size)
-        # else:
-        #     assert False
 
         return gen.to(self.device)

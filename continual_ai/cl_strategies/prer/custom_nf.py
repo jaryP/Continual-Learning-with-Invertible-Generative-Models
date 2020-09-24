@@ -51,33 +51,35 @@ class ChannelWiseLinearModel(nn.Module):
         elif isinstance(hidden_dim_channel, float):
             hidden_dim_channel = int(c * hidden_dim_channel)
 
-        # layers = [TransposeClass(-1, -2)]
-        #
-        # b = [ChannelWiseLinear((w, c), hidden_dim_channel), nn.ReLU()]
-        #
-        # for i in range(hidden_layers_channel):
-        #     b.append(ChannelWiseLinear((w, hidden_dim_channel), hidden_dim_channel))
-        #     b.append(nn.ReLU())
-        #
-        # b.append(ChannelWiseLinear((w, hidden_dim_channel), c))
-        # b = nn.Sequential(*b)
-        #
-        # layers.append(b)
-        # layers.append(TransposeClass(-1, -2))
+        layers = [TransposeClass(-1, -2)]
 
-        # layers = [TransposeClass(-1, -2)]
-        layers = []
-
-        b = [nn.Conv1d(c, hidden_dim_channel, kernel_size=3, padding=1, stride=1), nn.ReLU()]
+        b = [ChannelWiseLinear((w, c), hidden_dim_channel), nn.ReLU()]
 
         for i in range(hidden_layers_channel):
-            b.append(nn.Conv1d(hidden_dim_channel, hidden_dim_channel, kernel_size=3, padding=1, stride=1))
+            b.append(ChannelWiseLinear((w, hidden_dim_channel), hidden_dim_channel))
             b.append(nn.ReLU())
 
-        b.append(nn.Conv1d(hidden_dim_channel, c, kernel_size=3, padding=1, stride=1))
+        b.append(ChannelWiseLinear((w, hidden_dim_channel), c))
         b = nn.Sequential(*b)
 
-        self.net1 = torch.nn.Sequential(*b)
+        layers.append(b)
+        layers.append(TransposeClass(-1, -2))
+
+        self.net1 = torch.nn.Sequential(*layers)
+
+        # layers = [TransposeClass(-1, -2)]
+        # layers = []
+
+        # b = [nn.Conv1d(c, hidden_dim_channel, kernel_size=3, padding=1, stride=1), nn.ReLU()]
+        #
+        # for i in range(hidden_layers_channel):
+        #     b.append(nn.Conv1d(hidden_dim_channel, hidden_dim_channel, kernel_size=3, padding=1, stride=1))
+        #     b.append(nn.ReLU())
+        #
+        # b.append(nn.Conv1d(hidden_dim_channel, c, kernel_size=3, padding=1, stride=1))
+        # b = nn.Sequential(*b)
+
+        # self.net1 = torch.nn.Sequential(*b)
 
         b = [ChannelWiseLinear((c, w), hidden_dim_width), nn.ReLU()]
 
@@ -92,9 +94,9 @@ class ChannelWiseLinearModel(nn.Module):
         self.net = nn.Sequential(*b)
 
     def forward(self, x):
-        _x = self.net1(x)
-        _x = torch.relu(_x) #+ x
-        x = self.net(_x)  # + x
+        x = self.net1(x)
+        x = self.net(x)
+        # x = torch.relu(x) #+ x
         return x
 
 

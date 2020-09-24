@@ -64,7 +64,7 @@ class ElasticWeightConsolidation(NaiveMethod):
         # TODO: utilizzare il reale sample_size (come GEM)
 
         loss = 0
-        for i, (image, label) in enumerate(task):
+        for i, (_, image, label) in enumerate(task):
             emb = container.encoder(image)
             o = container.solver(emb, task=task.index)
 
@@ -105,7 +105,7 @@ class OnlineElasticWeightConsolidation(NaiveMethod):
         super().__init__()
         self.config = config.cl_technique_config
 
-        self.sample_size = self.config.get('sample_size', 200)
+        self.task_size = self.config.get('task_size', 200)
         self.importance = self.config.get('penalty_importance', 1e3)
         self.batch_size = self.config.get('batch_size', config.train_config['batch_size'])
         # self.num_batches = self.config.get('num_batches', config.train_config['batch_size'])
@@ -141,7 +141,7 @@ class OnlineElasticWeightConsolidation(NaiveMethod):
             self.loss(o, label).backward()
 
             _s += label.shape[0]
-            if _s >= self.sample_size:
+            if _s >= self.task_size:
                 break
 
         # f_matrix = {}

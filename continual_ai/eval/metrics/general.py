@@ -11,8 +11,7 @@ class TimeMetric(Metric):
         self.current_time = time()
 
     def on_task_ends(self, *args, **kwargs):
-        current_time = time()
-        self.total_time += current_time - self.current_time
+        self.total_time += time() - self.current_time
         self.current_time = None
 
     def __call__(self, *args, **kwargs):

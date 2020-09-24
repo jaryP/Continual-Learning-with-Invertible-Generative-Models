@@ -6,4 +6,4 @@ from .ewc import ElasticWeightConsolidation
 from .prer import InverseNFER
 from .gem import GradientEpisodicMemory
 from .lwf import LearningWithoutForgetting
-from .prer.PRER import PRER
+from .prer.PRER_batch_elternation import PRER

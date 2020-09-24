@@ -72,21 +72,22 @@ class SequentialFlow(torch.nn.Sequential):
 
 
 class Prior(torch.nn.Module):
-    def __init__(self, input_size, std=1):
+    def __init__(self, input_size):
         super().__init__()
 
-        self.to_flat = False
+        # self.to_flat = False
 
-        if isinstance(input_size, tuple):
-            # input_size = reduce(mul, input_size, 2)
-            #
-            # print(input_size)
-            input_size = (input_size[0], input_size[1] * input_size[2])
+        # if isinstance(input_size, tuple):
+        #     #     input_size = reduce(mul, input_size, 1)
+        #     #
+        #     # print(input_size)
+        #     input_size = (input_size[0], input_size[1] * input_size[2])
 
         # if isinstance(input_size, (list, tuple)):
         #     self.register_buffer('prior_mean', torch.zeros(*input_size))
         #     self.register_buffer('prior_var', torch.ones(*input_size))
         # else:
+
         self.register_buffer('prior_mean', torch.zeros(input_size))
         self.register_buffer('prior_var', torch.ones(input_size))
 

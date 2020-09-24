@@ -1,4 +1,6 @@
 import math
+from functools import reduce
+from operator import mul
 
 from typing import Callable
 
@@ -435,6 +437,7 @@ class RNVP(torch.nn.Module):
         if coupling_f is None:
             def coupling_f(ind, outd):
                 hs = hidden_size
+
                 if isinstance(hidden_size, float):
                     hs = int(hidden_size * ind)
 
@@ -452,38 +455,52 @@ class RNVP(torch.nn.Module):
                 return net
 
         self._levels = torch.nn.ModuleList()
-        in_dim = input_dim
+        self.input_dim = input_dim
+        self.to_flatten = False
+
+        in_dim = tuple(input_dim)
+
+        if isinstance(input_dim, (tuple, float)):
+            in_dim = reduce(mul, in_dim, 1)
+            self.to_flatten = True
+
         self.dims = []
 
+        d = in_dim
         for i in range(n_levels):
-            x_dim = in_dim // 2
-            z_dim = in_dim - in_dim // 2
+            x_dim = d // 2
+            z_dim = d - d // 2
 
-            level = RNVPLevel(in_dim, n_blocks=levels_blocks, coupling_f=coupling_f,
+            level = RNVPLevel(d, n_blocks=levels_blocks, coupling_f=coupling_f,
                               conditioning_size=conditioning_size)
-            in_dim = x_dim
+            d = x_dim
 
-            assert input_dim > 0
+            assert d > 0
 
             self.dims.append((x_dim, z_dim))
 
             self._levels.append(level)
 
-        last_dim = input_dim - sum(z for x, z in self.dims)
+        last_dim = in_dim - sum(z for x, z in self.dims)
         # last_z = in_dim - in_dim // 2
 
         # last_dim = in_dim
 
         self.dims.append((last_dim, last_dim))
-        self.g = Gaussianize(last_dim, last_dim, conditioning_size)
-        # self.norm = ActNorm(input_dim)
+        # print(self.dims)
 
+        self.g = Gaussianize(last_dim, last_dim, conditioning_size)
+
+        # self.norm = ActNorm(input_dim)
         # self.register_buffer('base_dist_mean', torch.zeros(1))
         # self.register_buffer('base_dist_var', torch.ones(1))
 
     def forward(self, x, y=None):
         log_det = 0
         zs = []
+
+        if self.to_flatten:
+            x = torch.flatten(x, 1)
 
         for m in self._levels:
             x, z, _log_det = m(x, y=y)
@@ -515,6 +532,10 @@ class RNVP(torch.nn.Module):
         log_det = 0
         # zs = []
 
+        if self.to_flatten:
+            u = torch.flatten(u, 1)
+
+        # print(u.shape)
         zs = torch.split(u, [zd for _, zd in self.dims], dim=1)
         # for xd, zd in self.dims:
         #     pass
@@ -533,6 +554,11 @@ class RNVP(torch.nn.Module):
 
         # x, _log_det = self.norm.backward(x)
         # log_det += _log_det
+
+        if self.to_flatten:
+            x = x.view((u.size(0),) + self.input_dim)
+
+        # print(x.shape)
 
         return x, log_det
 

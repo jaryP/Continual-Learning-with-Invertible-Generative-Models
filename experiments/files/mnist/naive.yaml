@@ -3,7 +3,7 @@ cl_technique_config:
 train_config:
   epochs: 20
   load: Yes
-  save_path: experiments/results/svhn/mt/no_shuffle/naive
+  save_path: experiments/results/mnist/naive
   experiments: 5
   cuda: Yes
   batch_size: 64
@@ -15,4 +15,4 @@ cl_config:
   cl_problem: MT
   shuffle_labels: No
   regularize: Yes
-  dataset: svhn
+  dataset: MNIST
