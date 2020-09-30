@@ -275,10 +275,10 @@ class CouplingLayer(torch.nn.Module):
         #     if isinstance(self._t[i], torch.nn.ReLU):
         #         self._t[i] = torch.nn.Tanh()
 
-        # self._s[-1].weight.data.zero_()
-        # self._s[-1].bias.data.zero_()
-        self.rescale = torch.nn.utils.weight_norm(Rescale(self.out_dim))
-        # self.log_scale_factor = torch.nn.Parameter(torch.zeros(self.out_dim), requires_grad=True)
+        self._s[-1].weight.data.zero_()
+        self._s[-1].bias.data.zero_()
+        # self.rescale = torch.nn.utils.weight_norm(Rescale(self.out_dim))
+        self.log_scale_factor = torch.nn.Parameter(torch.zeros(self.out_dim), requires_grad=True)
 
     def s(self, x, y, f):
 
@@ -294,8 +294,8 @@ class CouplingLayer(torch.nn.Module):
 
         # s, t = self._s(x), self._t(x)
 
-        # s = s  # * self.log_scale_factor.exp()
-        s = self.rescale(torch.tanh(s))
+        s = torch.sigmoid(s) * self.log_scale_factor.exp()
+        # s = self.rescale(torch.sigmoid(s))
         # s = torch.tanh(s) * self.rescale
 
         return s, t
@@ -395,9 +395,8 @@ class BatchNorm(torch.nn.Module):
 class RNVPBlock(SequentialFlow):
     def __init__(self, input_dim, coupling_f=None, conditioning_size=0):
         super().__init__(BatchNorm(input_dim),
-                         #ActNorm((1,input_dim,1)),
-                         Permutation(input_dim),
-                         CouplingLayer(input_dim, conditioning_size=conditioning_size, function=coupling_f),)
+                         CouplingLayer(input_dim, conditioning_size=conditioning_size, function=coupling_f),
+                         Permutation(input_dim))
 
 
 class RNVPLevel(torch.nn.Module):
@@ -446,6 +445,7 @@ class RNVP(torch.nn.Module):
                 for i in range(n_hidden):
                     s.append(torch.nn.Linear(hs, hs))
                     s.append(torch.nn.ReLU())
+                    # s.append(nn.Dropout(0.25))
                     # s.append(torch.nn.BatchNorm1d(hs))
 
                 s.append(torch.nn.Linear(hs, outd))
@@ -458,11 +458,14 @@ class RNVP(torch.nn.Module):
         self.input_dim = input_dim
         self.to_flatten = False
 
-        in_dim = tuple(input_dim)
+        in_dim = input_dim
 
-        if isinstance(input_dim, (tuple, float)):
-            in_dim = reduce(mul, in_dim, 1)
-            self.to_flatten = True
+        if not isinstance(in_dim, int):
+            in_dim = tuple(in_dim)
+
+            if isinstance(input_dim, (tuple, float)):
+                in_dim = reduce(mul, in_dim, 1)
+                self.to_flatten = True
 
         self.dims = []
 

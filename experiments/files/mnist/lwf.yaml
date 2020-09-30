@@ -1,9 +1,12 @@
 cl_technique_config:
-  name: naive
+  name: lwf
+  memory_size: 500
+  temperature: 1
+  alpha: 0.5
 train_config:
   epochs: 20
   load: Yes
-  save_path: experiments/results/mnist/naive
+  save_path: experiments/results/mnist/lwf
   experiments: 5
   cuda: Yes
   batch_size: 64
@@ -12,7 +15,7 @@ train_config:
   lr: 0.001
 cl_config:
   label_per_task: 2
-  cl_problem: sit
+  cl_problem: MT
   shuffle_labels: No
   regularize: Yes
   dataset: MNIST

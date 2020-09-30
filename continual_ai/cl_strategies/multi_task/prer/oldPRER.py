@@ -24,7 +24,7 @@ from .student_teacher import StudentTeacher
 from .utils import Conditioner, Prior, modify_batch
 from continual_ai.utils import ExperimentConfig
 from .vae import VAE
-from ...cl_settings import SingleIncrementalTaskSolver
+from continual_ai.cl_settings import SingleIncrementalTaskSolver
 
 
 class Hook:

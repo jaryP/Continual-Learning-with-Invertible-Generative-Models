@@ -1,19 +1,11 @@
-from collections import Counter
-
-import itertools
+from functools import reduce
+from operator import mul
 
 import numpy as np
 import torch
-import torchvision
 from torch import nn
-from torch.utils.data import DataLoader
-from torchvision.transforms import transforms
-from torchvision.utils import save_image
 
 from continual_ai.cl_settings.base import ClassificationTask
-from continual_ai.cl_strategies.prer.maf import MAF
-from continual_ai.cl_strategies.prer.no_split_rnvp import RNVP
-from continual_ai.cl_strategies.prer.rnvp_cnn import RNVP as RNVPCNN
 
 from continual_ai.datasets import MNIST, SVHN, CIFAR10  # , CIFAR10, KMNIST, K49MNIST, SVHN
 # from model import Glow
@@ -127,21 +119,21 @@ def get_model(dataset):
             # nn.ReLU(),
             # nn.Conv2d(24, 24, 3, stride=1, padding=1),
             # nn.ReLU(),
-            # nn.Flatten(),
-            # nn.Linear(48 * 4 * 4, emb_dim),
+            nn.Flatten(),
+            nn.Linear(24 * 6 * 6, 100),
             # nn.Tanh(),
         )
 
         decoder = nn.Sequential(
             # nn.Tanh(),
             # nn.ReLU(),
-            # nn.Linear(emb_dim + conditioning, 48 * 4 * 4),
-            # Reshape((48, 4, 4)),
+            nn.Linear(100, 24 * 6 * 6),
+            Reshape((24, 6, 6)),
             # nn.ReLU(),
             # nn.ConvTranspose2d(24, 24, 3, stride=1, padding=1),
             # nn.ReLU(),
             # nn.ConvTranspose2d(24, 24, 4, stride=2, padding=1),
-            # nn.ReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(24, 12, 4, stride=2, padding=0),
             nn.ReLU(),
             nn.ConvTranspose2d(12, 1, 4, stride=2, padding=1),
@@ -149,7 +141,8 @@ def get_model(dataset):
         )
 
         embedding_dim = encoder(torch.rand((1, 1, 28, 28))).shape[1:]
-        # print(embedding_dim)
+        if len(embedding_dim) == 1:
+            embedding_dim = embedding_dim[0]
 
     # elif dataset == 'cifar10':
     #     encoder = nn.Sequential(
@@ -180,35 +173,35 @@ def get_model(dataset):
     #         nn.Sigmoid(),
     #     )
 
-    elif dataset == 'kmnist' or dataset == 'k49mnist':
-
-        encoder = nn.Sequential(
-            nn.Conv2d(3, 24, 3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(24, 24, 3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(24, 48, 3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(48, 48, 4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(48, 48, 4, stride=2, padding=0),
-        )
-
-        decoder = nn.Sequential(
-            nn.ReLU(),
-            nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose2d(48, 24, 3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose2d(24, 24, 3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose2d(24, 3, 3, stride=1, padding=0),
-            nn.Sigmoid(),
-        )
-
-        embedding_dim = encoder(torch.rand((1, 1, 28, 28))).shape[1:]
+    # elif dataset == 'kmnist' or dataset == 'k49mnist':
+    #
+    #     encoder = nn.Sequential(
+    #         nn.Conv2d(3, 24, 3, stride=1, padding=0),
+    #         nn.ReLU(),
+    #         nn.Conv2d(24, 24, 3, stride=1, padding=0),
+    #         nn.ReLU(),
+    #         nn.Conv2d(24, 48, 3, stride=1, padding=0),
+    #         nn.ReLU(),
+    #         nn.Conv2d(48, 48, 4, stride=2, padding=0),
+    #         nn.ReLU(),
+    #         nn.Conv2d(48, 48, 4, stride=2, padding=0),
+    #     )
+    #
+    #     decoder = nn.Sequential(
+    #         nn.ReLU(),
+    #         nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
+    #         nn.ReLU(),
+    #         nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
+    #         nn.ReLU(),
+    #         nn.ConvTranspose2d(48, 24, 3, stride=1, padding=0),
+    #         nn.ReLU(),
+    #         nn.ConvTranspose2d(24, 24, 3, stride=1, padding=0),
+    #         nn.ReLU(),
+    #         nn.ConvTranspose2d(24, 3, 3, stride=1, padding=0),
+    #         nn.Sigmoid(),
+    #     )
+    #
+    #     embedding_dim = encoder(torch.rand((1, 1, 28, 28))).shape[1:]
 
     elif dataset == 'svhn' or dataset == 'cifar10':
         encoder = nn.Sequential(
@@ -219,14 +212,25 @@ def get_model(dataset):
             nn.Conv2d(24, 48, 3, stride=1, padding=0),
             nn.ReLU(),
             nn.Conv2d(48, 48, 4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(48, 48, 4, stride=2, padding=0),
+            # nn.ReLU(),
+            # nn.Conv2d(24, 24, 4, stride=2, padding=0),
         )
 
+        tuple_dim = encoder(torch.rand((1, 3, 32, 32))).shape[1:]
+        flat_tuple_dim = reduce(mul, tuple_dim, 1)
+        # embedding_dim = flat_tuple_dim
+        embedding_dim = 100
+        # print(tuple_dim)
+
+        encoder.add_module('flatten', nn.Flatten())
+        encoder.add_module('linear', nn.Linear(flat_tuple_dim, embedding_dim))
+
         decoder = nn.Sequential(
+            nn.Linear(embedding_dim, flat_tuple_dim),
+            Reshape(tuple_dim),
             nn.ReLU(),
-            nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
-            nn.ReLU(),
+            # nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
+            # nn.ReLU(),
             nn.ConvTranspose2d(48, 48, 4, stride=2, padding=0),
             nn.ReLU(),
             nn.ConvTranspose2d(48, 24, 3, stride=1, padding=0),
@@ -237,7 +241,7 @@ def get_model(dataset):
             nn.Sigmoid(),
         )
 
-        embedding_dim = encoder(torch.rand((1, 3, 32, 32))).shape[1:]
+        # embedding_dim = encoder(torch.rand((1, 3, 32, 32))).shape[1:]
 
     else:
         raise ValueError('The dataset parameters can be {}'.format(['mnist', 'cifar10', 'kmnist', 'k49mnist']))

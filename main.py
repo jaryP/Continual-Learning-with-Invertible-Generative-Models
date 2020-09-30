@@ -12,8 +12,9 @@ from copy import deepcopy
 
 from base import get_dataset, classification_score_on_task, get_predictions, get_model
 from continual_ai.cl_settings import MultiHeadTaskSolver, SingleIncrementalTaskSolver, MultiTask, SingleIncrementalTask
-from continual_ai.cl_strategies import NaiveMethod, ElasticWeightConsolidation, GradientEpisodicMemory, \
-    EmbeddingRegularization, LearningWithoutForgetting, Container, PRER
+from continual_ai.cl_strategies.multi_task import ElasticWeightConsolidation, GradientEpisodicMemory, \
+    EmbeddingRegularization, LearningWithoutForgetting, PRER
+from continual_ai.cl_strategies import NaiveMethod, Container
 # from continual_ai.cl_strategies.prer.PRER_custom_nf import PRER
 
 from continual_ai.eval import Accuracy, BackwardTransfer, Evaluator, TotalAccuracy, F1, ExperimentsContainer, TimeMetric
@@ -152,16 +153,14 @@ for seed in range(config.train_config['experiments']):
                                batch_size=config.train_config['batch_size'],
                                labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
 
-        f = None
-
-        solver = MultiHeadTaskSolver(input_dim=emb_dim, topology=f)
+        solver = MultiHeadTaskSolver(input_dim=emb_dim)
         # TODO: implement SIT problem for each method
 
-    # elif cl_problem == 'sit':
-    # Cl_Dataset = SingleIncrementalTask(dataset=dataset_loader, random_state=rs, preprocessing=preprocessing,
-    #                                    batch_size=config.train_config['batch_size'],
-    #                                    labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
-    # solver = SingleIncrementalTaskSolver(input_dim=emb_dim, flat_input=True)
+    elif cl_problem == 'sit':
+        Cl_Dataset = SingleIncrementalTask(dataset=dataset_loader, random_state=rs,
+                                           batch_size=config.train_config['batch_size'],
+                                           labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
+        solver = SingleIncrementalTaskSolver(input_dim=emb_dim, flat_input=True)
 
     else:
         assert False

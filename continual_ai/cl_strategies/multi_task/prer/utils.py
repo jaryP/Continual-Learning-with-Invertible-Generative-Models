@@ -273,9 +273,9 @@ class Conditioner(nn.Module):
             self._embeddings = torch.nn.Embedding(classes, dimension)
             self.c = self.embedding
             self.size = dimension
-        elif self.type == 'none':
-            self.c = lambda x: None
-            self.size = 0
+        # elif self.type == 'none':
+        #     self.c = lambda x: None
+        #     self.size = 0
         else:
             assert False
 
@@ -402,8 +402,7 @@ def modify_batch(x, y, decoder, generative_model, labels, conditioner, prior, ze
     return x, y
 
 
-def generate_batch(size, reconstructor, generative_model, labels, conditioner, prior, device):
-    reconstructor.eval()
+def generate_embeddings(size, generative_model, labels, conditioner, prior, device):
     generative_model.eval()
     conditioner.eval()
     prior.eval()
@@ -413,14 +412,18 @@ def generate_batch(size, reconstructor, generative_model, labels, conditioner, p
         probs[i] = 1
 
     m = Categorical(probs)
-    y_sampled = m.sample(torch.Size([size]))
+    y = m.sample(torch.Size([size]))
 
-    # embs = generative_model.sample(size, y=conditioner(y_sampled))
     u = prior.sample(size)
-    embs, _ = generative_model.backward(u, y=conditioner(y_sampled))
-    # embs, _ = generative_model.backward(size, y=conditioner(y_sampled))
+    embs, _ = generative_model.backward(u, y=conditioner(y))
 
+    return embs, y.long()
+
+
+def generate_batch(size, reconstructor, generative_model, labels, conditioner, prior, device):
+    reconstructor.eval()
+
+    embs, y = generate_embeddings(size, generative_model, labels, conditioner, prior, device)
     z = reconstructor(embs)
-    y = y_sampled.long()
 
     return z, y, embs

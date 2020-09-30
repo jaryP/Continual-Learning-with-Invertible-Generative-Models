@@ -14,6 +14,7 @@ import torch
 from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
 from torch import optim
+from torch.distributions import Categorical
 from torch.nn import NLLLoss
 from torch.optim import Adam, SGD
 
@@ -23,10 +24,10 @@ from .dcgan import DCGAN
 from .maf import MAF
 from .rnvp import RNVP, ActNorm, BatchNorm
 from .student_teacher import StudentTeacher
-from .utils import Conditioner, Prior, modify_batch, generate_batch
+from .utils import Conditioner, Prior, modify_batch, generate_batch, generate_embeddings
 from continual_ai.utils import ExperimentConfig
 from .vae import VAE
-from ...cl_settings import SingleIncrementalTaskSolver
+from continual_ai.cl_settings import SingleIncrementalTaskSolver
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
 
 
@@ -140,7 +141,10 @@ class PRER(NaiveMethod):
         #     self.prior = Prior(self.z_dim, std=prior_std)
         # else:
 
-        self.prior = Prior(reduce(mul, emb_dim, 1))
+        if hasattr(emb_dim, '__len__'):
+            self.prior = Prior(reduce(mul, emb_dim, 1))
+        else:
+            self.prior = Prior(emb_dim)
 
         # self.prior = Prior((emb_dim[0], emb_dim[1] * emb_dim[2]))
 
@@ -160,10 +164,11 @@ class PRER(NaiveMethod):
             assert False
 
         self.generator = self.get_generator()
+        print(self.generator)
 
         total_params = sum(p.numel() for p in itertools.chain(self.generator.parameters(),
                                                               self.conditioner.parameters(),
-                                                              self.prior.parameters()))
+                                                                   self.prior.parameters()))
 
         if logger is not None:
             logger.info('Offline NF parameters:')
@@ -264,9 +269,6 @@ class PRER(NaiveMethod):
                 if container.current_task.index > 0:
                     images, labels, old_embeddings = self.get_sampled_images(emb.size(0))
 
-                    # if e == 0 and i == 0:
-                    #     x_plot = images
-
                     emb = container.encoder(images)
                     x_rec = self.decoder(emb)
 
@@ -280,10 +282,25 @@ class PRER(NaiveMethod):
                                                                                    torch.flatten(old_embeddings, 1),
                                                                                    dim=-1))
 
-                    rec_loss = self.rec_loss(x_rec, images)
                     dis_reg = dis_reg.mean()
 
-                    loss += rec_loss + cross_entropy + dis_reg * self.er  # + l1_loss * self.l1
+                    rec_loss = self.rec_loss(x_rec, images)
+
+                    # print(e, i, dis_reg.item())
+
+                    old_loss = rec_loss + cross_entropy + dis_reg * self.er  # + l1_loss * self.l1
+
+                    loss = (1 - self.old_w) * loss + self.old_w * old_loss
+
+                    # autoencoder_opt.zero_grad()
+                    # loss.backward()
+                    # autoencoder_opt.step()
+
+                    if e % 5 == 0 and e > 0 and self.plot_dir is not None:
+                        f = self.plot_rec(x_rec, container)
+                        f.savefig(os.path.join(self.plot_dir, '{}_oldtask_rec_images_task{}.png'
+                                               .format(e, container.current_task.index)))
+                        plt.close(f)
 
                 autoencoder_opt.zero_grad()
                 loss.backward()
@@ -297,55 +314,58 @@ class PRER(NaiveMethod):
 
     def nf_training(self, container: Container):
 
-        self.nf = self.get_generator()
+        # self.generator = self.get_generator()
 
         container.encoder.eval()
 
         inn_optimizer = torch.optim.Adam(itertools.chain(self.generator.parameters(),
-                                                         self.conditioner.parameters()), lr=1e-3, weight_decay=1e-5)
+                                                         self.conditioner.parameters()), lr=1e-4, weight_decay=1e-5)
 
         container.current_task.set_labels_type('dataset')
         to_plot = list(itertools.chain(*self.task_labels, container.current_task.dataset_labels))
+        
+        # if False:
+        #     with torch.no_grad():
+        #         indexes = []
+        #         losses = []
+        #         self.decoder.train()
+        #         container.encoder.train()
+        #
+        #         for _, (i, images, labels) in enumerate(container.current_task(self.train_batch_size)):
+        #             emb = container.encoder(images)
+        #
+        #             x_rec = self.decoder(emb)
+        #
+        #             pred = self.autoencoder_classifier(torch.flatten(emb, 1))
+        #             cross_entropy = torch.nn.functional.cross_entropy(pred,
+        #                                                               labels.long(), reduction='none')
+        #             cross_entropy *= self.cew
+        #             rec_loss = self.rec_loss(x_rec, images, reduction='none').view(cross_entropy.size(0), -1).sum(1)
+        #
+        #             loss = cross_entropy + rec_loss
+        #
+        #             losses.extend(loss)
+        #             indexes.extend(i)
+        #
+        #         # sort desc
+        #         # prendo indici ed estraggo gli indici veri
+        #         # faccio un sampling del sottoinsieme
+        #
+        #         losses = torch.stack(losses).tolist()
+        #
+        #         values = zip(losses, indexes)
+        #         values = sorted(values, key=lambda x: x[0], reverse=True)
+        #         losses, indexes = zip(*values)
+        #         # indexes = indexes[self.subset_size]
+        #
+        #         indexes = indexes[5000:]
+        #         # indexes = torch.tensor(indexes, device=self.device)
+        #
+        #         data_to_iter = container.current_task(self.train_batch_size,
+        #                                               sampler=torch.utils.data.SubsetRandomSampler(indexes))
+        # else:
 
-        if False:
-            with torch.no_grad():
-                indexes = []
-                losses = []
-                self.decoder.train()
-                container.encoder.train()
-
-                for _, (i, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-                    emb = container.encoder(images)
-
-                    x_rec = self.decoder(emb)
-
-                    pred = self.autoencoder_classifier(torch.flatten(emb, 1))
-                    cross_entropy = torch.nn.functional.cross_entropy(pred,
-                                                                      labels.long(), reduction='none')
-                    cross_entropy *= self.cew
-                    rec_loss = self.rec_loss(x_rec, images, reduction='none')
-
-                    loss = cross_entropy + rec_loss
-
-                    losses.extend(loss)
-                    indexes.extend(i)
-
-                # sort desc
-                # prendo indici ed estraggo gli indici veri
-                # faccio un sampling del sottoinsieme
-
-                losses = torch.stack(losses).tolist()
-
-                values = zip(losses, indexes)
-                values = sorted(values, key=lambda x: x[0], reverse=True)
-                losses, indexes = zip(*values)
-                indexes = indexes[self.subset_size]
-
-                # indexes = torch.tensor(values[:100], device=self.device)
-
-                data_to_iter = torch.utils.data.RandomSampler(container.current_task(self.train_batch_size), indexes)
-        else:
-            data_to_iter = container.current_task(self.train_batch_size)
+        data_to_iter = container.current_task(self.train_batch_size)
 
         for e in range(self.generator_epochs):
             if e % 5 == 0 and self.plot_dir is not None:
@@ -354,15 +374,65 @@ class PRER(NaiveMethod):
                                        .format(container.current_task.index, e)))
                 plt.close(f)
 
+                # with torch.no_grad():
+                #     container.encoder.eval()
+                #     container.solver.eval()
+                #
+                #     true_labels = []
+                #     predicted_labels = []
+                #
+                #     _true_labels = []
+                #     _predicted_labels = []
+                #
+                #     # sampled = generate_batch(1000, self.old_decoder, self.generator,
+                #     #                          container.current_task.dataset_labels, self.conditioner,
+                #     #                          self.prior, self.device)
+                #
+                #     to_sample = 100
+                #     sampled = generate_embeddings(to_sample, self.generator,
+                #                                   container.current_task.dataset_labels, self.conditioner,
+                #                                   self.prior, self.device)
+                #     sampled = tuple(zip(*sampled))
+                #
+                #     sampled_images_memory = DataLoader(sampled, 32, drop_last=False)
+                #     tot_similarity = 0
+                #
+                #     for emb, y in sampled_images_memory:
+                #         true_labels.extend(y.tolist())
+                #         # emb = container.encoder(x)
+                #         a = container.solver(emb, task=0)
+                #         predicted_labels.extend(a.max(dim=1)[1].tolist())
+                #
+                #         new_emb = container.encoder(self.decoder(emb))
+                #
+                #         dis_reg = torch.nn.functional.cosine_similarity(torch.flatten(emb, 1),
+                #                                                         torch.flatten(
+                #                                                             new_emb, 1),
+                #                                                         dim=-1)
+                #         tot_similarity += dis_reg.sum().item()
+                #
+                #         a = container.solver(new_emb, task=0)
+                #         _predicted_labels.extend(a.max(dim=1)[1].tolist())
+                #
+                #     xt, xp = np.asarray(true_labels), np.asarray(predicted_labels)
+                #
+                #     _xp = np.asarray(_predicted_labels)
+                #
+                #     print(e, (xt == xp).sum() / len(xt), (xt == _xp).sum() / len(xt),  tot_similarity / to_sample)
+                #
+                #     del sampled
+
             for i, (_, images, labels) in enumerate(data_to_iter):
                 with torch.no_grad():
                     emb = container.encoder(images)
+                    # emb = torch.nn.functional.dropout(emb, .5, True)
 
                 self.generator.train()
                 self.prior.train()
                 self.conditioner.train()
 
-                u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
+                # u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
+                u, log_det = self.generator(emb)
 
                 if len(log_det.shape) > 1:
                     log_det = log_det.sum(1)
@@ -390,7 +460,9 @@ class PRER(NaiveMethod):
                     log_prob = self.prior.log_prob(u)
                     log_prob = torch.flatten(log_prob, 1).sum(1)
 
-                    loss += -torch.mean(log_prob + log_det)
+                    old_loss = -torch.mean(log_prob + log_det)
+
+                    loss = (1 - self.old_w) * loss + self.old_w * old_loss
 
                 inn_optimizer.zero_grad()
                 loss.backward()
@@ -398,12 +470,58 @@ class PRER(NaiveMethod):
 
         container.current_task.set_labels_type('task')
 
+    def generate_embeddings(self, size, generative_model, labels, conditioner, prior):
+        generative_model.eval()
+        conditioner.eval()
+        prior.eval()
+
+        if conditioner is not None:
+            probs = torch.zeros(max(labels) + 1, device=self.device)
+            for i in labels:
+                probs[i] = 1
+
+            m = Categorical(probs)
+            y = m.sample(torch.Size([size]))
+            y_cond = conditioner(y)
+            y = y.long()
+        else:
+            y_cond = None
+            y = None
+
+        u = prior.sample(size)
+        embs, _ = generative_model.backward(u, y=y_cond)
+
+        return embs, y
+
+    def generate_conditioned_batch(self, size, reconstructor, generative_model, labels, conditioner, prior):
+        reconstructor.eval()
+
+        embs, y = self.generate_embeddings(size, generative_model, labels, conditioner, prior)
+        z = reconstructor(embs)
+
+        return z, y, embs
+
+    def generate_predicted_batch(self, size, reconstructor, generative_model, labels, predicter, prior):
+        reconstructor.eval()
+        predicter.eval()
+
+        embs, _ = self.generate_embeddings(size, generative_model, labels, None, prior)
+        pred = predicter(embs)
+        y = pred.max(dim=1)[1]
+        y = y.long()
+
+        z = reconstructor(embs)
+
+        return z, y, embs
+
     @torch.no_grad()
     def get_sampled_images(self, size: int):
         if self.fixed_replay:
             if self.sampled_images_memory is None:
-                sampled = generate_batch(self.fixed_replay, self.old_decoder, self.old_generator,
-                                         self.old_labels, self.old_conditioner, self.prior, self.device)
+                print('NONE')
+                with torch.no_grad():
+                    sampled = generate_batch(self.fixed_replay, self.decoder, self.generator,
+                                             self.old_labels, self.conditioner, self.prior, self.device)
 
                 sampled = tuple(zip(*sampled))
 
@@ -435,30 +553,57 @@ class PRER(NaiveMethod):
 
         self._t2d[container.current_task.index] = dl
 
+        for k, v in container.current_task.d2t.items():
+            self._d2t[k] = torch.tensor(v, dtype=torch.long, device=self.device)
+
         self.autoencoder_training(container)
-        self.nf_training(container)
-
-        old_nf = self.get_generator()
-
-        old_nf.load_state_dict(self.generator.state_dict())
-
-        self.old_generator = old_nf.to(self.device)
-
-        self.old_conditioner = deepcopy(self.conditioner)
-
-        self.old_generator.eval()
-
-        # self.old_decoder = deepcopy(self.decoder)
-        self.old_decoder.load_state_dict(self.decoder.state_dict())
-        self.old_decoder.eval()
 
         for h in self.hooks:
             h.close()
 
     def on_task_ends(self, container: Container, *args, **kwargs):
 
+        self.nf_training(container)
+
+        # with torch.no_grad():
+        #     print('Prova')
+        #     container.encoder.eval()
+        #     container.solver.eval()
+        #
+        #     true_labels = []
+        #     predicted_labels = []
+        #
+        #     # sampled = generate_batch(1000, self.old_decoder, self.generator,
+        #     #                          container.current_task.dataset_labels, self.conditioner,
+        #     #                          self.prior, self.device)
+        #     sampled = generate_embeddings(1000, self.generator,
+        #                                   container.current_task.dataset_labels, self.conditioner,
+        #                                   self.prior, self.device)
+        #     sampled = tuple(zip(*sampled))
+        #
+        #     sampled_images_memory = DataLoader(sampled, 32, drop_last=False)
+        #
+        #     for emb, y in sampled_images_memory:
+        #         true_labels.extend(y.tolist())
+        #         # emb = container.encoder(x)
+        #         a = container.solver(emb, task=0)
+        #         predicted_labels.extend(a.max(dim=1)[1].tolist())
+        #
+        #     xt, xp = np.asarray(true_labels), np.asarray(predicted_labels)
+        #
+        #     print((xt == xp).sum() / len(xt))
+
         self.old_labels.extend(container.current_task.dataset_labels)
         self.task_labels.append(container.current_task.dataset_labels)
+        self.sampled_images_memory = None
+
+        if self.fixed_replay:
+            self.old_generator = self.get_generator().to(self.device)
+            self.old_generator.load_state_dict(self.generator.state_dict())
+            self.old_conditioner = deepcopy(self.conditioner)
+            self.old_generator.eval()
+            self.old_decoder.load_state_dict(self.decoder.state_dict())
+            self.old_decoder.eval()
 
         if self.plot_dir is not None:
             _, x_plot, _ = container.current_batch
@@ -495,7 +640,8 @@ class PRER(NaiveMethod):
                     u = self.prior.sample(1)
                     # print(u.shape)
 
-                    emb, _ = self.generator.backward(u, y=self.conditioner(y))
+                    # emb, _ = self.generator.backward(u, y=self.conditioner(y))
+                    emb, _ = self.generator.backward(u)
 
                     # emb = torch.cat([emb, self.conditioner(y)], 1)
 
@@ -592,7 +738,10 @@ class PRER(NaiveMethod):
 
         # gen = MAF(self.blocks, self.emb_dim, 600, self.n_levels, self.conditioner.size,)
 
+        # gen = RNVP(n_levels=self.n_levels, levels_blocks=self.blocks, input_dim=self.emb_dim,
+        #            n_hidden=self.n_hidden, conditioning_size=self.conditioner.size, hidden_size=self.hidden_size)
+
         gen = RNVP(n_levels=self.n_levels, levels_blocks=self.blocks, input_dim=self.emb_dim,
-                   n_hidden=self.n_hidden, conditioning_size=self.conditioner.size, hidden_size=self.hidden_size)
+                   n_hidden=self.n_hidden, conditioning_size=0, hidden_size=self.hidden_size)
 
         return gen.to(self.device)

@@ -5,9 +5,6 @@ from operator import mul
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
-
-from continual_ai.cl_strategies.prer.rnvp import ActNorm
 
 
 class FlowSequential(nn.Sequential):

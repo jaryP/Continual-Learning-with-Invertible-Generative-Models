@@ -125,8 +125,11 @@ class SingleIncrementalTaskSolver(nn.Module):
 
         self.flat_input = flat_input
 
-        if isinstance(input_dim, (tuple, list)):
+        if hasattr(input_dim, '__len__') and len(input_dim) > 1:
             input_dim = reduce(mul, input_dim, 1)
+            self.flat_input = True
+        else:
+            self.flat_input = False
 
         self.input_dim = input_dim
 
@@ -156,8 +159,8 @@ class SingleIncrementalTaskSolver(nn.Module):
                                      torch.nn.Linear(ind // 4, outd)])
 
     def _get_wb(self, in_features, out_features):
-        w = torch.Tensor(out_features, in_features)
-        b = torch.Tensor(out_features)
+        w = torch.empty(out_features, in_features)
+        b = torch.empty(out_features)
         torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
         bound = 1 / np.sqrt(in_features)
         torch.nn.init.uniform_(b, -bound, bound)
@@ -206,5 +209,5 @@ class SingleIncrementalTaskSolver(nn.Module):
         super(SingleIncrementalTaskSolver, self).load_state_dict(state_dict, strict=True)
 
     def trainable_parameters(self, t=None, recuse=True):
-        for param in itertools.chain(self.__net.parameters(recuse), self.w, self.b):
+        for param in itertools.chain(self.__net.parameters(recuse), [self.w, self.b]):
             yield param

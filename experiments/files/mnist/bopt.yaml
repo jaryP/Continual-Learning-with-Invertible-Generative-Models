@@ -1,28 +1,25 @@
 cl_technique_config:
   name: prer
-  blocks: 20
-  n_levels: 2
-  autoencoder_epochs: 10
+  z_dim: 10
+  blocks: 10
+  n_levels: 3
+  autoencoder_epochs: 2
   generator_epochs: 20
-  rec_loss: bce
-  hidden_size: 1.0
-  n_hiddens: 0
-  fixed_replay: 10000
-  plot: No
+  rec_loss: mse
   conditioning_config:
     type: one_hot
     dimension: 10
   weights:
     er: 1
-    l1: 0
+    l1: 0.001
 train_config:
-  epochs: 20
-  load: Yes
-  save_path: experiments/results/mnist/prer
+  epochs: 5
+  load: No
+  save_path: experiments/results/opt/mnist
   experiments: 5
   cuda: Yes
-  batch_size: 64
-  save: Yes
+  batch_size: 128
+  save: No
   optimizer: adam
   lr: 0.001
 cl_config:

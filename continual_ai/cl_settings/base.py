@@ -14,6 +14,7 @@ class ClassificationTask(ClassificationDataset):
         self.__subset = 'train'
         self.index = None
         self.current_batch_size = None
+        self.current_sampler = None
 
         self.dataset_labels = []
         self.task_labels = []
@@ -77,18 +78,26 @@ class ClassificationTask(ClassificationDataset):
     def __len__(self):
         return super(ClassificationTask, self).__len__()  # // self.batch_size + 1
 
-    def __call__(self, batch_size=None):
+    def __call__(self, batch_size=None, sampler=None):
         self.current_batch_size = batch_size
+        # if current_sampler is None:
+        #     self.current_sampler = RandomSampler(self)
         return self
 
     def __iter__(self):
 
         batch = self.batch_size
+        sampler = RandomSampler(self)
+
         if self.current_batch_size is not None:
             batch = self.current_batch_size
             self.current_batch_size = None
 
-        for idx in BatchSampler(batch_size=batch, sampler=RandomSampler(self), drop_last=False):
+        if self.current_sampler is not None:
+            sampler = self.current_sampler
+            self.current_sampler = None
+
+        for idx in BatchSampler(batch_size=batch, sampler=sampler, drop_last=False):
             x, y, idxs = [], [], []
             for i in idx:
                 _i, _x, _y = self[i]

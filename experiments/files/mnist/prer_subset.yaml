@@ -1,9 +1,9 @@
 cl_technique_config:
   name: prer
-  blocks: 20
+  blocks: 10
   n_levels: 2
   autoencoder_epochs: 10
-  generator_epochs: 20
+  generator_epochs: 50
   rec_loss: bce
   hidden_size: 1.0
   n_hiddens: 0
@@ -18,7 +18,7 @@ cl_technique_config:
 train_config:
   epochs: 20
   load: Yes
-  save_path: experiments/results/mnist/prer
+  save_path: experiments/results/mnist/prer_subset
   experiments: 5
   cuda: Yes
   batch_size: 64
