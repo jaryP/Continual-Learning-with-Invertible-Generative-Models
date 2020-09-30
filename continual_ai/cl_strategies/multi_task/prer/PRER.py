@@ -116,7 +116,7 @@ class PRER(NaiveMethod):
         self.plot_step = config.cl_technique_config.get('plot_step', 5)
 
         self.ae_conditioned = config.cl_technique_config.get('ae_conditioned', True)
-        self.conditioner_fine_tuning = config.cl_technique_config['conditioning_config']\
+        self.conditioner_fine_tuning = config.cl_technique_config['conditioning_config'] \
             .get('conditioner_fine_tuning', False)
 
         regularization = config.cl_technique_config['regularization']
@@ -354,13 +354,12 @@ class PRER(NaiveMethod):
         container.encoder.eval()
 
         parameters = list(self.generator.parameters())
-
         if self.conditioner is not None:
             parameters.extend(list(self.conditioner.parameters()))
 
         if self.ae_conditioned and self.conditioner_fine_tuning:
-            print('True')
-            parameters.extend(list(self.autoencoder_classifier.trainable_parameters()))
+            conditioner_fine_tuning_opt = torch.optim.Adam(list(self.autoencoder_classifier.trainable_parameters()),
+                                                           lr=1e-4)
 
         inn_optimizer = torch.optim.Adam(parameters, lr=self.nf_lr,
                                          weight_decay=self.nf_weight_decay)
@@ -493,7 +492,11 @@ class PRER(NaiveMethod):
                 cum_loss += loss.item()
 
                 inn_optimizer.zero_grad()
+                if self.ae_conditioned and self.conditioner_fine_tuning:
+                    conditioner_fine_tuning_opt.zero_grad()
                 loss.backward()
+                if self.ae_conditioned and self.conditioner_fine_tuning:
+                    conditioner_fine_tuning_opt.step()
                 inn_optimizer.step()
 
             cum_loss /= (i + 1)
@@ -533,7 +536,7 @@ class PRER(NaiveMethod):
             predicted_labels.extend(a.max(dim=1)[1].tolist())
 
         a, b = np.asarray(true_labels), np.asarray(predicted_labels)
-        print((a == b).sum()/len(a))
+        print((a == b).sum() / len(a))
 
     def combine_batches(self, xa, xb, ya, yb, zero_prob: float = None):
         if self.reg_type == 'concatenation':
