@@ -11,7 +11,6 @@ from torch import nn
 
 from continual_ai.cl_strategies import NaiveMethod, Container
 from .utils import qp
-from continual_ai.iterators import Sampler, RandomBatchIterator
 from continual_ai.utils import ExperimentConfig
 
 
@@ -35,8 +34,8 @@ class GradientEpisodicMemory(NaiveMethod):
         gem_config = config.cl_technique_config
         self.margin = gem_config.get('margin', 0.5)
         self.task_memory_size = gem_config.get('task_memory_size', 500)
-        self.batch_size = gem_config.get('batch_size', config.train_config['batch_size'])
-        self.sample_size = gem_config.get('sample_size', self.task_memory_size)
+        # self.batch_size = gem_config.get('batch_size', config.train_config['batch_size'])
+        # self.sample_size = gem_config.get('sample_size', self.task_memory_size)
 
         if random_state is None or isinstance(random_state, int):
             self.RandomState = np.random.RandomState(random_state)
@@ -50,8 +49,8 @@ class GradientEpisodicMemory(NaiveMethod):
             logger.info('GEM parameters:')
             logger.info(F'\tMargin: {self.margin}')
             logger.info(F'\tTask memory size: {self.task_memory_size}')
-            logger.info(F'\tSample size: {self.sample_size}')
-            logger.info(F'\tBatch size: {self.batch_size}')
+            # logger.info(F'\tSample size: {self.sample_size}')
+            # logger.info(F'\tBatch size: {self.batch_size}')
 
         self.task_memory = []
         self.loss_f = nn.CrossEntropyLoss(reduction='mean')
@@ -88,13 +87,13 @@ class GradientEpisodicMemory(NaiveMethod):
             for i, t in enumerate(self.task_memory):
 
                 container.encoder.train()
-                container.solver.eval()
+                container.solver.train()
 
                 container.encoder.zero_grad()
                 container.solver.zero_grad()
 
-                loss = 0
-                _n = 0
+                # loss = 0
+                # _n = 0
 
                 # for b in RandomBatchIterator(t(), batch_size=self.batch_size, random_state=self.RandomState):
                 #

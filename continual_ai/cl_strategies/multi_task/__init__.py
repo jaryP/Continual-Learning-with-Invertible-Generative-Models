@@ -5,3 +5,4 @@ from .ewc import ElasticWeightConsolidation
 from .gem import GradientEpisodicMemory
 from .lwf import LearningWithoutForgetting
 from .prer import PRER
+from .gfr_il import GFRiL

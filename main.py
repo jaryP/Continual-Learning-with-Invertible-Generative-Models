@@ -3,21 +3,19 @@ import itertools
 import logging
 import numpy as np
 import yaml
-import sys
 import os.path
 import torch
 from torch import optim
-import pickle
-from copy import deepcopy
+import dill as pickle
 
-from base import get_dataset, classification_score_on_task, get_predictions, get_model
+from tqdm import tqdm
+
+from base import get_dataset, get_predictions, Encoder
 from continual_ai.cl_settings import MultiHeadTaskSolver, SingleIncrementalTaskSolver, MultiTask, SingleIncrementalTask
-from continual_ai.cl_strategies.multi_task import ElasticWeightConsolidation, GradientEpisodicMemory, \
-    EmbeddingRegularization, LearningWithoutForgetting, PRER
 from continual_ai.cl_strategies import NaiveMethod, Container
-# from continual_ai.cl_strategies.prer.PRER_custom_nf import PRER
 
-from continual_ai.eval import Accuracy, BackwardTransfer, Evaluator, TotalAccuracy, F1, ExperimentsContainer, TimeMetric
+from continual_ai.eval import Accuracy, BackwardTransfer, Evaluator, TotalAccuracy, F1, ExperimentsContainer, \
+    TimeMetric, LastBackwardTransfer, FinalAccuracy
 from continual_ai.utils import ExperimentConfig
 
 
@@ -37,7 +35,6 @@ def my_custom_logger(logger_name, level=logging.INFO):
 
     return logger
 
-
 parser = argparse.ArgumentParser(description='Main.')
 parser.add_argument('path', action='store', help='The path of the experiment file to load.')
 parser.add_argument('--cuda', '--gpu', action='store', default=-1, help='The gpu to use.', type=int)
@@ -51,7 +48,6 @@ experiment_file = args.path
 
 experiment_config = yaml.load(open(experiment_file), Loader=yaml.FullLoader)
 config = ExperimentConfig(experiment_file)
-
 ########################################################################
 
 base_experiment_path = config.train_config['save_path']
@@ -59,8 +55,8 @@ base_experiment_path = config.train_config['save_path']
 if not os.path.exists(base_experiment_path):
     os.makedirs(base_experiment_path)
 
-    with open(os.path.join(base_experiment_path, 'config.yml'), 'w') as outfile:
-        yaml.dump(experiment_config, outfile, default_flow_style=False)
+with open(os.path.join(base_experiment_path, 'config.yml'), 'w') as outfile:
+    yaml.dump(experiment_config, outfile, default_flow_style=False)
 
 print(F'Config file loaded: {experiment_file}.')
 print(F'with parameters:\n {config.__str__()}.')
@@ -68,20 +64,17 @@ print(F'with parameters:\n {config.__str__()}.')
 final_train = ExperimentsContainer()
 final_test = ExperimentsContainer()
 
-for seed in range(config.train_config['experiments']):
-
-    # if seed > 0:
-    #     continue
+seed_bar = tqdm(range(config.train_config['experiments']), desc='Experiment', leave=False)
+for seed in seed_bar:
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     rs = np.random.RandomState(seed)
 
     experiment_path = os.path.join(base_experiment_path, F'exp_{str(seed)}')
-    print(experiment_path)
+    seed_bar.set_postfix({'Save path': experiment_path})
 
     if config.train_config['load'] and os.path.exists(os.path.join(experiment_path, 'final_results.pkl')):
-
         with open(os.path.join(experiment_path, 'final_results.pkl'), 'rb') as file:
             results = pickle.load(file)
 
@@ -89,8 +82,6 @@ for seed in range(config.train_config['experiments']):
         final_test.add_evaluator(results['test'])
 
         continue
-
-    config.train_config['save'] = False
 
     plot_path = os.path.join(experiment_path, 'plots')
     models_path = os.path.join(experiment_path, 'models')
@@ -108,12 +99,9 @@ for seed in range(config.train_config['experiments']):
     logger.info(F'Save path: {experiment_path}.')
 
     device = 'cpu'
-
     if torch.cuda.is_available() and args.cuda >= 0 and args.cuda != 'cpu':
         torch.cuda.set_device(args.cuda)
-        device = 'cuda'
-
-    print('Device {} will be used'.format(device))
+        device = 'cuda:{}'.format(args.cuda)
 
     dataset_loader, preprocessing, image_channels, image_shape, classes = \
         get_dataset(config.cl_config['dataset'], device)
@@ -125,16 +113,46 @@ for seed in range(config.train_config['experiments']):
     cl_problem = config.cl_config['cl_problem']
     mn = config.cl_technique_config['name']
 
-    encoder, decoder, emb_dim = get_model(config.cl_config['dataset'])
+    encoder = Encoder(config.cl_config['dataset'])
+    # emb_dim = encoder.embedding_dim
+
+    # encoder, decoder, emb_dim = get_model(config.cl_config['dataset'])
 
     logger.info(F'Model created.')
 
     logger.info(F'Continual Learning Strategy: {config.cl_technique_config["name"]}.')
 
-    if mn == 'prer':
+    if cl_problem == 'mt':
+        Cl_Dataset = MultiTask(dataset=dataset_loader, random_state=rs,
+                               batch_size=config.train_config['batch_size'],
+                               labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
+
+        solver = MultiHeadTaskSolver(input_dim=encoder.embedding_dim)
+
+        from continual_ai.cl_strategies.multi_task import ElasticWeightConsolidation, \
+    GradientEpisodicMemory, \
+    EmbeddingRegularization, LearningWithoutForgetting, PRER, GFRiL
+
+    elif cl_problem == 'sit':
+        Cl_Dataset = SingleIncrementalTask(dataset=dataset_loader, random_state=rs,
+                                           batch_size=config.train_config['batch_size'],
+                                           labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
+        solver = SingleIncrementalTaskSolver(input_dim=encoder.embedding_dim, flat_input=True)
+
+        from continual_ai.cl_strategies.single_incremental_task import ElasticWeightConsolidation, \
+            GradientEpisodicMemory, EmbeddingRegularization, LearningWithoutForgetting, PRER
+
+    else:
+        assert False
+
+    # if mn == 'prer':
+    #     config.train_config['save'] = True
+    #     cl_method = PRER(encoder=encoder, config=config, classes=classes, device=device,
+    #                      plot_dir=plot_path, random_state=rs, logger=logger)
+    if mn == 'prer_proj' or mn == 'prer':
         config.train_config['save'] = True
-        cl_method = PRER(decoder=decoder, emb_dim=emb_dim, config=config, classes=classes, device=device,
-                         plot_dir=plot_path, random_state=rs, logger=logger)
+        cl_method = PRER(encoder=encoder, config=config, classes=classes, device=device,
+                             plot_dir=plot_path, random_state=rs, logger=logger)
     elif mn == 'naive':
         cl_method = NaiveMethod()
     elif mn == 'ewc':
@@ -145,23 +163,11 @@ for seed in range(config.train_config['experiments']):
         cl_method = EmbeddingRegularization(config=config, random_state=rs, logger=logger)
     elif mn == 'lwf':
         cl_method = LearningWithoutForgetting(config=config, random_state=rs, logger=logger)
-    else:
-        assert False
-
-    if cl_problem == 'mt':
-        Cl_Dataset = MultiTask(dataset=dataset_loader, random_state=rs,
-                               batch_size=config.train_config['batch_size'],
-                               labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
-
-        solver = MultiHeadTaskSolver(input_dim=emb_dim)
-        # TODO: implement SIT problem for each method
-
-    elif cl_problem == 'sit':
-        Cl_Dataset = SingleIncrementalTask(dataset=dataset_loader, random_state=rs,
-                                           batch_size=config.train_config['batch_size'],
-                                           labels_per_task=labels_per_task, shuffle_labels=shuffle_labels)
-        solver = SingleIncrementalTaskSolver(input_dim=emb_dim, flat_input=True)
-
+    elif mn == 'gan':
+        cl_method = GFRiL(config=config, random_state=rs, logger=logger,
+                          num_classes=classes, device=device,
+                          feat_dim=encoder.embedding_dim,
+                          hidden_dim=encoder.embedding_dim)
     else:
         assert False
 
@@ -182,11 +188,14 @@ for seed in range(config.train_config['experiments']):
     container.solver = solver
 
     test_results = Evaluator(classification_metrics=[Accuracy(), F1()],
-                             cl_metrics=[BackwardTransfer(), TotalAccuracy()], other_metrics=TimeMetric())
+                             cl_metrics=[BackwardTransfer(), TotalAccuracy(), FinalAccuracy(), LastBackwardTransfer()],
+                             other_metrics=TimeMetric())
     train_results = Evaluator(classification_metrics=[Accuracy(), F1()],
-                              cl_metrics=[BackwardTransfer(), TotalAccuracy()], other_metrics=TimeMetric())
+                              cl_metrics=[BackwardTransfer(), TotalAccuracy(), FinalAccuracy(), LastBackwardTransfer()],
+                              other_metrics=TimeMetric())
 
-    for task in Cl_Dataset:
+    task_bar = tqdm(Cl_Dataset, desc='Task', leave=False)
+    for task in task_bar:
 
         train_results.on_task_starts()
 
@@ -230,7 +239,8 @@ for seed in range(config.train_config['experiments']):
         bets_res = 0
         best_model = (None, None)
 
-        for e in range(config.train_config['epochs']):
+        e_bar = tqdm(range(config.train_config['epochs']), leave=False, desc='Epochs')
+        for e in e_bar:
 
             container.current_epoch = e
 
@@ -248,7 +258,8 @@ for seed in range(config.train_config['experiments']):
             task.train()
             task.set_labels_type('task')
 
-            for batch_idx, (indexes, x, y) in enumerate(task):
+            for batch_idx, (indexes, x, y) in tqdm(enumerate(task), leave=False,
+                                                   total=len(task) // config.train_config['batch_size']):
                 encoder.train()
                 solver.train()
 
@@ -264,6 +275,8 @@ for seed in range(config.train_config['experiments']):
 
                 class_ce = torch.nn.functional.cross_entropy(pred, y)
                 loss = class_ce
+
+                e_bar.set_postfix({'ce': class_ce.item()})
 
                 container.current_loss = loss
 
@@ -292,38 +305,20 @@ for seed in range(config.train_config['experiments']):
                 y_true, y_pred = get_predictions(encoder, solver, t)
                 train_results.evaluate(y_true, y_pred, current_task=task.index, evaluated_task=t.index)
 
+            task_bar.set_postfix(test_results.cl_results()['Accuracy'])
+
             if test_results.cl_results()['Accuracy']['TotalAccuracy'] > bets_res:
-                best_model = (solver.state_dict(), decoder.state_dict())
+                best_model = (solver.state_dict(), encoder.state_dict())  # decoder.state_dict())
                 bets_res = test_results.cl_results()['Accuracy']['TotalAccuracy']
 
+        # task_bar.set_postfix(bets_res['Accuracy'])
+
         solver.load_state_dict(best_model[0])
-        decoder.load_state_dict(best_model[1])
-
-        cl_method.on_task_ends(container)
-
-        if config.train_config['save']:
-            with open(test_results_path, 'wb') as file:
-                pickle.dump(test_results, file, protocol=pickle.HIGHEST_PROTOCOL)
-
-            with open(train_results_path, 'wb') as file:
-                pickle.dump(train_results, file, protocol=pickle.HIGHEST_PROTOCOL)
-
-            all_test_results.append(test_results)
-            all_train_results.append(train_results)
-
-            with open(os.path.join(models_path, F'task{task_n}_cl_strategy.cl'), 'wb') as file:
-                pickle.dump(cl_method, file, protocol=pickle.HIGHEST_PROTOCOL)
-
-            state = {'encoder': encoder, 'solver': solver, 'optimizer': optimizer}
-
-            torch.save(state, os.path.join(models_path, F'task{task_n}_state.pth'))
-
-        train_results.on_task_ends()
+        encoder.load_state_dict(best_model[1])
 
         logger.info(F'Training on task #{task_n} over.\n')
 
         logger.info(F'Test split results:')
-        print(test_results.cl_results())
 
         for k in test_results.classification_metrics:
             logger.info(F'{k}: \n{test_results.cl_results()[k]}\n{test_results.task_matrix[k]}')
@@ -349,7 +344,26 @@ for seed in range(config.train_config['experiments']):
         final_train.add_evaluator(train_results)
         final_test.add_evaluator(test_results)
 
-    # if config.train_config['save']:
+        train_results.on_task_ends()
+        cl_method.on_task_ends(container)
+
+        if config.train_config['save']:
+            with open(test_results_path, 'wb') as file:
+                pickle.dump(test_results, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+            with open(train_results_path, 'wb') as file:
+                pickle.dump(train_results, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+            all_test_results.append(test_results)
+            all_train_results.append(train_results)
+
+            with open(os.path.join(models_path, F'task{task_n}_cl_strategy.cl'), 'wb') as file:
+                pickle.dump(cl_method, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+            state = {'encoder': encoder, 'solver': solver, 'optimizer': optimizer}
+
+            torch.save(state, os.path.join(models_path, F'task{task_n}_state.pth'))
+
     with open(os.path.join(experiment_path, 'final_results.pkl'), 'wb') as file:
         pickle.dump({'train': train_results, 'test': test_results}, file,
                     protocol=pickle.HIGHEST_PROTOCOL)
@@ -357,6 +371,16 @@ for seed in range(config.train_config['experiments']):
     logger.info('Training process complete.')
 
 print('Final score')
+
+print('Train score')
+for k, v in final_train.cl_metrics().items():
+    print('{}: {}'.format(k, v))
+print('\t{}'.format(final_train.others_metrics()))
+
+print('Test score:')
+for k, v in final_test.cl_metrics().items():
+    print('{}: {}'.format(k, v))
+print('\t{}'.format(final_test.others_metrics()))
 
 logger = my_custom_logger(os.path.join(base_experiment_path, 'final_score.log'))
 logger.info('Train score:')

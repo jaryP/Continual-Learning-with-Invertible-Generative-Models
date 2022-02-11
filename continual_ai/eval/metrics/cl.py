@@ -28,12 +28,10 @@ class LastBackwardTransfer(ContinualLearningMetric):
         if T == 1:
             return 1
 
-        v = 0
         last = r[-1, :]
+        diag = np.diagonal(r)
 
-        for i in range(T - 1):
-            v += (last[i] - r[i, i])
-        v = v / (T - 1)
+        v = np.mean(last - diag)
 
         return v
 

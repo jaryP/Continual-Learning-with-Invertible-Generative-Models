@@ -1,9 +1,5 @@
-from collections import Counter
-from copy import deepcopy
-
 import itertools
-from functools import reduce
-from operator import mul
+from copy import deepcopy
 
 import numpy as np
 import os
@@ -13,150 +9,134 @@ import logging
 import torch
 import torchvision
 from matplotlib import pyplot as plt
-from torch import optim
+from torch import optim, autograd
 from torch.distributions import Categorical
-from torch.optim import Adam, SGD
+from torch.optim import Adam
+from tqdm import tqdm
 
+from base import Encoder, Decoder
 from continual_ai.cl_strategies import NaiveMethod, Container
-from .rnvp import RNVP, ActNorm, BatchNorm
-from .utils import Conditioner, Prior, modify_batch, generate_batch, generate_embeddings
+from .rnvp import RNVP
+from .utils import Conditioner, Prior, reconstruction_loss, NoneConditioner
 from continual_ai.utils import ExperimentConfig
 from continual_ai.cl_settings import SingleIncrementalTaskSolver
-from torch.utils.data import Dataset, DataLoader, SequentialSampler, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, ConcatDataset, \
+    BatchSampler
 
 
-class Hook:
-    def __init__(self, module):
-        self.hook = module.register_forward_hook(self.fn)
+class PRERproj(NaiveMethod):
 
-    def fn(self, module, input, output):
-        self.input = input
-        self.output = output
-
-    def close(self):
-        self.hook.remove()
-
-
-def gaussian_nll(mu, log_sigma, x):
-    return 0.5 * torch.pow((x - mu) / log_sigma.exp(), 2) + log_sigma + 0.5 * np.log(2 * np.pi)
-
-
-def reconstruction_loss(x_hat, x):
-    log_sigma = ((x - x_hat) ** 2).mean().sqrt().log()
-    log_sigma = -6 + torch.nn.functional.softplus(log_sigma + 6)
-    rec = gaussian_nll(x_hat, log_sigma, x)
-    # rec = 0.5 * torch.pow((x - x_hat) / log_sigma.exp(), 2) + log_sigma + 0.5 * np.log(2 * np.pi)
-    return rec.sum()
-
-
-class PRER(NaiveMethod):
-    # TODO: valutare segunti modifche: 1) prior per ogni task con una piccola rete che prende un embedding
-    #  e genera mu e sigma, 2) Multi head generative model, 3) Miglioramento imamgini con metodi
-    #  adversarial (https://arxiv.org/pdf/1704.02304.pdf), 4) Implementare samples delle Y in base all'embedding
-    #  delle classi del task corrente (solo se il conditioner utilizza non one_hot) 5) annettere Prior e Conditioner nel
-    #  NF (?)
-    # TODO: 1) Scelta del tipo di regolarizzazione (alternation, overwriting, concatenation), 2) pulire codice,
-    #  3) regolarizzazione AE, 4) spostarsi su plot pytorch
-    # TODO: 1) Provare alternation, overwriting (done), concatenation
-
-    def __init__(self, decoder: torch.nn.Module, emb_dim: tuple, config: ExperimentConfig, classes: int, device,
+    def __init__(self, encoder: Encoder, config: ExperimentConfig, classes: int,
+                 device,
                  plot_dir: str,
                  logger: logging.Logger = None, **kwargs):
         super().__init__()
 
         self.config = config
         self.device = device
-
         self.plot_dir = plot_dir
-
         self.classes = classes
+        self.emb_dim = encoder.embedding_dim
+        self.projector = torch.nn.Sequential(
+            torch.nn.Linear(encoder.flat_cnn_size, encoder.embedding_dim),
+            # torch.nn.Sigmoid()
+        ).to(self.device)
 
-        ws = {'old_tasks': 0.5, 'er': 1, 'l1': 0.0001, 'ce': 1}
-        ws.update(config.cl_technique_config.get('weights', {}))
+        self.prior = Prior(encoder.embedding_dim)
+        self.reset_nf = config.cl_technique_config.get('reset_nf', False)
+        self.reset_decoder = config.cl_technique_config.get('reset_decoder', False)
 
-        self.train_batch_size = config.cl_technique_config.get('train_batch_size', config.train_config['batch_size'])
+        ae_config = config.cl_technique_config['autoencoder']
 
-        rec_loss = config.cl_technique_config.get('rec_loss', 'bce')
+        self.autoencoder_lr = ae_config.get('lr', 1e-3)
+        self.ae_batch_size = ae_config.get('batch_size',
+                                           config.train_config['batch_size'])
+        self.rec_loss_type = ae_config.get('rec_loss', 'gaussian')
+        self.softclip = ae_config.get('softclip', 0)
 
-        if rec_loss == 'mse':
-            self.rec_loss = torch.nn.functional.mse_loss
-        elif rec_loss == 'gaussian':
-            self.rec_loss = reconstruction_loss
-        elif rec_loss == 'bce':
-            self.rec_loss = torch.nn.functional.binary_cross_entropy
+        ae_cond = ae_config.get('conditioning_config', {'type': None})
+        ae_conditioner_type = ae_cond['type']
+
+        self.ae_conditioner = NoneConditioner()
+        self.autoencoder_classifier = None
+
+        if ae_conditioner_type == 'one_hot' or ae_conditioner_type == 'class_embedding':
+            self.ae_conditioner = Conditioner(ae_cond, classes)
+        # elif ae_conditioner_type == 'nn':
+        #     self.autoencoder_classifier = SingleIncrementalTaskSolver(self.emb_dim, device=self.device)
+        elif ae_conditioner_type == 'none':
+            pass
         else:
             assert False
 
-        prior_std = config.cl_technique_config.get('prior_std', 1)
-        assert prior_std > 0
+        self.conditioner_fine_tuning = ae_cond.get('conditioner_fine_tuning',
+                                                   False) and self.autoencoder_classifier is not None
+
+        decoder = Decoder(config.cl_config['dataset'], encoder,
+                          cond_size=self.ae_conditioner.size)
+        self.decoder = decoder
+
+        ws = config.cl_technique_config.get('weights', {})
 
         self.old_w = ws.get('old_tasks', 0.5)
         self.er = ws.get('er', 1)
-        self.l1 = ws.get('l1', 0.001)
-        self.cew = ws.get('ce', 1)
+        self.l1 = ws.get('l1', 0)
+        self.ce = ws.get('ce', 1)
+        self.rec = ws.get('rec', 1)
 
         self.cl_problem = config.cl_config['cl_problem']
-        self.autoencoder_epochs = config.cl_technique_config['autoencoder_epochs']
+        self.autoencoder_epochs = config.cl_technique_config[
+            'autoencoder_epochs']
         self.generator_epochs = config.cl_technique_config['generator_epochs']
 
-        # self.model = config.cl_technique_config.get('model_type', 'rnvp').lower()
-        # self.n_levels = config.cl_technique_config.get('n_levels', 1)
-        # self.blocks = config.cl_technique_config.get('blocks', 5)
-        # self.n_hidden = config.cl_technique_config.get('n_hiddens', 0)
-        # self.hidden_size = config.cl_technique_config.get('hidden_size', 1.0)
-        self.autoencoder_lr = config.train_config['lr']
-        self.z_dim = config.cl_technique_config.get('z_dim', emb_dim)
-        # se fixed remplay è intero allora è il numero di immagini da mettere nella memoria da cui pescare immagini
-        # self.fixed_replay = config.cl_technique_config.get('fixed_replay', False)
-        # self.batch_combination = config.cl_technique_config.get('batch_combination', 'overwrite')
         to_plot = config.cl_technique_config.get('plot', False)
         if not to_plot:
             self.plot_dir = None
-
         self.plot_step = config.cl_technique_config.get('plot_step', 5)
-
-        self.ae_conditioned = config.cl_technique_config.get('ae_conditioned', True)
-        self.conditioner_fine_tuning = config.cl_technique_config['conditioning_config'] \
-            .get('conditioner_fine_tuning', False)
 
         regularization = config.cl_technique_config['regularization']
         self.fixed_replay = regularization['fixed_replay']
+        assert self.fixed_replay > 0
+        if self.fixed_replay < self.ae_batch_size:
+            self.fixed_replay = self.ae_batch_size
+
+        self.distance = regularization.get('distance', 'cosine')
+        self.er_sample = regularization.get('to_sample', self.ae_batch_size)
+
         self.reg_type = regularization['type']
-        assert self.reg_type in ['concatenation', 'alternation', 'overwrite'], \
-            'Regularization type can be [concatenation, alternation, overwrite]'
+        assert self.reg_type in ['alternation', 'overwrite'], \
+            'Regularization type can be [alternation, overwrite]'
 
         nf = config.cl_technique_config['nf']
         self.levels = nf.get('levels', 1)
         self.blocks = nf.get('blocks', 5)
-        self.n_hidden = nf.get('n_hiddens', 0)
+        self.n_hidden = nf.get('n_hiddens', 1)
         self.hidden_size = nf.get('hidden_size', 1.0)
         self.nf_lr = nf.get('lr', 1e-3)
         self.nf_weight_decay = nf.get('weight_decay', 1e-5)
         self.tolerance_training = nf.get('tolerance_training', False)
         self.tolerance = nf.get('tolerance', 10)
+        self.tolerance_cap = nf.get('tolerance_cap', np.inf)
+        self.nf_batch_size = nf.get('batch_size',
+                                    config.train_config['batch_size'])
+        self.anneal_lr = nf.get('annealing', False)
 
-        assert 0 < self.old_w < 1
+        nf_cond_config = config.cl_technique_config['nf']['conditioning_config']
+        conditioner_type = nf_cond_config['type']
 
-        self.decoder = decoder
+        self.nf_conditioner = NoneConditioner()
 
-        cod_type = config.cl_technique_config['conditioning_config']['type']
-
-        if cod_type == 'autoencoder':
-            assert self.ae_conditioned
-            self.conditioner = None
-        elif cod_type in ['one_hot', 'class_embedding']:
-            self.conditioner = Conditioner(config.cl_technique_config, classes, emb_dim=emb_dim)
+        if conditioner_type in ['one_hot', 'class_embedding']:
+            if ae_conditioner_type == conditioner_type:
+                self.nf_conditioner = self.ae_conditioner
+            else:
+                self.nf_conditioner = Conditioner(nf_cond_config, classes)
+        elif conditioner_type == 'none':
+            pass
         else:
             assert False
 
-        self.autoencoder_classifier = None
-
-        self.emb_dim = emb_dim
-
-        if hasattr(emb_dim, '__len__'):
-            emb_dim = reduce(mul, emb_dim, 1)
-
-        self.prior = Prior(emb_dim)
+        self.nf_conditioner_type = conditioner_type
 
         opt = config.train_config['optimizer']
 
@@ -167,294 +147,450 @@ class PRER(NaiveMethod):
         else:
             assert False
 
-        total_params = sum(p.numel() for p in itertools.chain(itertools.chain(self.get_generator().parameters(),
-                                                                              self.prior.parameters())))
-        if self.conditioner is not None:
-            total_params += sum([p.numel() for p in self.conditioner.parameters()])
-        if self.ae_conditioned:
-            autoencoder_classifier = SingleIncrementalTaskSolver(emb_dim)
+        total_params = sum(p.numel() for p in itertools.chain(
+            itertools.chain(self.get_generator().parameters(),
+                            self.prior.parameters(),
+                            self.decoder.parameters(),
+                            self.projector.parameters(),
+                            self.nf_conditioner.parameters())))
+
+        if self.autoencoder_classifier is not None:
+            autoencoder_classifier = SingleIncrementalTaskSolver(self.emb_dim)
             autoencoder_classifier.add_task(classes)
-            total_params += sum([p.numel() for p in autoencoder_classifier.trainable_parameters()])
+            total_params += sum([p.numel() for p in
+                                 autoencoder_classifier.trainable_parameters()])
 
         if logger is not None:
             logger.info('Offline NF parameters:')
-            # logger.info(F'\tLevels: {self.n_levels}')
-            # logger.info(F'\tBlocks: {self.blocks}')
-            # logger.info(F'\tN hiddens: {self.n_hidden}')
-            # logger.info(F'\tHidden layers dim: {self.hidden_size}')
             logger.info(F'\tAE train epochs: {self.autoencoder_epochs}')
             logger.info(F'\tNF train epochs: {self.generator_epochs}')
-            # logger.info(F'\tReconstruction loss: {rec_loss}')
-            # logger.info(F'\tTraining batch size: {self.train_batch_size}')
-            # logger.info(F'\tRegularization batch size: {self.reg_batch_size}')
             logger.info(F'\tweights: {ws}')
             logger.info(F'\tNumber of parameters: {total_params}')
+            logger.info(
+                F'\tNF parameters: {sum(p.numel() for p in self.get_generator().parameters())}')
             logger.info(F'\tEmbedding dim: {self.emb_dim}')
 
-        self.autoencoder_opt = None
-        self.hooks = []
-
-        self._d2t = torch.empty(classes, device=device, dtype=torch.long).fill_(-1)
-
+        self._d2t = torch.empty(classes, device=device, dtype=torch.long).fill_(
+            -1)
         self._t2d = {}
 
-        self.all_labels = []
-        self.old_labels = []
+        self.old_dataset_labels = []
+        self.dataset_labels = []
         self.task_labels = []
+        self.old_datasets = []
 
-        self.old_generator = None
-        self.old_decoder = None
-        self.old_conditioner = None
         self.sampled_images_memory = None
         self.generator = self.get_generator()
+        self.past_encoder = None
+
+    def rec_loss(self, x, xr, reduction='mean'):
+        if self.rec_loss_type == 'mse':
+            return torch.nn.functional.mse_loss(x, xr, reduction=reduction)
+        elif self.rec_loss_type == 'gaussian':
+            return reconstruction_loss(x, xr, reduction=reduction,
+                                       softclip=self.softclip)
+        if self.rec_loss_type == 'bce':
+            return torch.nn.functional.binary_cross_entropy(x, xr,
+                                                            reduction=reduction)
+        else:
+            assert False
+
+    def distance_function(self, e1, e2):
+        if self.distance == 'cosine':
+            # torch.nn.functional.normalize()
+            return torch.nn.functional.cosine_similarity(e1, e2, dim=-1)
+        elif self.distance == 'euclidean':
+            return torch.norm(e1 - e2, p=2, dim=-1)
+        else:
+            assert False
+
+    def before_gradient_calculation(self, container: Container):
+        if container.current_task.index > 0:
+            with torch.no_grad():
+
+                # old_images, old_labels, _ = self.sample(self.er_sample,
+                #                                         labels=self.
+                #                                         old_dataset_labels)
+
+                # old_images, old_labels = BatchSampler(
+                #     ConcatDataset(self.old_datasets), self.er_sample, False)
+                old_images, old_labels = next(iter(
+                    DataLoader(ConcatDataset(self.old_datasets),
+                               batch_size=self.er_sample, shuffle=True)))
+
+                if container.current_epoch == 0 and \
+                        not os.path.exists(
+                            os.path.join(self.plot_dir, 'images_reg.png')):
+
+                    f = torchvision.utils.make_grid(old_images.cpu(),
+                                                    scale_each=True,
+                                                    range=(0, 1)).numpy()
+                    f = plt.imshow(np.transpose(f, (1, 2, 0)),
+                                   interpolation='nearest')
+                    f.figure.savefig(
+                        os.path.join(self.plot_dir, 'images_reg.png'))
+
+                # old_images, old_labels, _, classification_embeddings = \
+                #     self.get_sampled_images(
+                #         self.er_sample * container.current_task.index)
+            # print(old_images.min(), old_images.max())
+            # dis_reg = self.distance_function(container.encoder(old_images),
+            #                                  classification_embeddings)
+            dis_reg = 0
+
+            for old_dataset in self.old_datasets:
+                old_images, old_labels = next(iter(
+                    DataLoader(old_dataset,
+                               batch_size=self.er_sample, shuffle=True)))
+
+                d = self.distance_function(container.encoder(old_images),
+                                                 self.past_encoder(old_images))
+                d = d.mean()
+                dis_reg += d
+
+            dis_reg /= len(self.old_datasets)
+
+            container.current_loss += (dis_reg * self.er)
+
+        if self.l1 > 0:
+            l1_loss = torch.tensor(0.0, dtype=torch.float, device=self.device)
+
+            for m in itertools.chain(container.encoder.parameters()):
+                l1_loss += self.l1 * m.abs().sum()
+
+            container.current_loss += l1_loss
 
     def autoencoder_training(self, container):
 
-        for param in container.encoder.parameters():
-            param.requires_grad = True
+        posfix = {}
 
-        _, images, labels = next(iter(container.current_task(self.train_batch_size)))
+        labels = container.current_task.dataset_labels
+        labels_proportions = len(container.current_task) // len(labels)
 
-        if self.ae_conditioned:
+        images, labels = [], []
+        for _, im, lb in container.current_task(self.ae_batch_size):
+            images.append(im)
+            labels.append(lb)
 
-            emb = container.encoder(images)
-            emb = torch.flatten(emb, 1)
+        images = torch.cat(images, 0)
+        labels = torch.cat(labels, 0).long()
 
-            if self.autoencoder_classifier is None:
-                # self.autoencoder_classifier = torch.nn.Sequential(*[
-                #     torch.nn.Linear(emb.size(1), emb.size(1) // 2), torch.nn.ReLU(),
-                #     torch.nn.Linear(emb.size(1) // 2, self.classes)]).to(self.device)
-                self.autoencoder_classifier = SingleIncrementalTaskSolver(emb.size(1)).to(self.device)
+        dataset = TensorDataset(images, labels)
 
-            self.autoencoder_classifier.add_task(len(container.current_task.task_labels))
-            self.autoencoder_classifier = self.autoencoder_classifier.to(self.device)
+        # with torch.no_grad():
+        #     if len(self.old_dataset_labels) > 0:
+        #     old_images, old_labels = [], []
+        #     for i in self.old_dataset_labels:
+        #         images, y, _ = self.sample(labels_proportions, labels=[i])
+        #         old_images.append(images)
+        #         old_labels.append(y)
+        #         assert not torch.isnan(images).any()
+        #
+        #     old_images = torch.cat(old_images, 0)
+        #     old_labels = torch.cat(old_labels, 0).long()
+        #
+        #     print(old_images.max(), old_images.min())
 
-            autoencoder_opt = Adam(
-                itertools.chain(itertools.chain(self.decoder.parameters(),
-                                                self.autoencoder_classifier.trainable_parameters(),
-                                                container.encoder.parameters())), lr=0.001)
-        else:
-            autoencoder_opt = Adam(
-                itertools.chain(itertools.chain(self.decoder.parameters(), container.encoder.parameters())), lr=0.001)
+        # old_dataset = TensorDataset(old_images, old_labels)
+
+        if len(self.old_datasets) == 0:
+            d = [dataset] + self.old_datasets
+            dataset = ConcatDataset(d)
+        # else:
+        #     dataset = self.old_datasets[0]
+
+        # dataset = container.current_task(self.ae_batch_size)
+        dataset = DataLoader(dataset, batch_size=self.ae_batch_size,
+                             shuffle=True)
+        # else:
+        #     dataset = container.current_task(self.ae_batch_size)
+
+        """
+        
+        with torch.no_grad():
+            for i, (_, images, y) in enumerate(
+                    container.current_task(self.ae_batch_size)):
+                emb = container.encoder.flatten_cnn(images)
+                emb = self.projector(emb)
+                embs.append(emb)
+                labels.append(y)
+            d = len(embs)
+            
+            if len(self.old_dataset_labels) > 0:
+                for i in self.old_dataset_labels:
+                    images, y, _ = self.sample(d, labels=[i])
+                    _embs = container.encoder.flatten_cnn(images)
+                    _embs = self.projector(_embs)
+                    # for _emb, _y in zip(_embs, y):
+                    embs.append(_embs)
+                    labels.append(y)
+                    # im, lb, nfemb = self.sample(d, labels=[i])
+                    # emb = container.encoder.flatten_cnn(im)
+                    # emb = self.projector(emb)
+                    #
+                    # embs.extend(emb)
+                    # labels.append(lb)
+
+            embs = torch.cat(embs, 0)
+            labels = torch.cat(labels, 0).long()
+
+            if self.sampled_images_memory is not None:
+                cat = torch.cat((embs, self.sampled_images_memory.tensors[2].to(
+                    self.device)), 0)
+                mn = cat.mean(0)
+                std = cat.std(0)
+            else:
+                mn = embs.mean(0)
+                std = embs.std(0)
+
+        # self.generator.set_mean_std(mn, std)
+
+        data_to_iter = DataLoader(TensorDataset(embs, labels),
+                                  batch_size=self.nf_batch_size, shuffle=True)
+        """
+
+        if self.reset_decoder:
+            decoder = Decoder(self.config.cl_config['dataset'],
+                              container.encoder,
+                              cond_size=self.ae_conditioner.size)
+            self.decoder = decoder.to(self.device)
+            self.projector = torch.nn.Sequential(
+                torch.nn.Linear(container.encoder.flat_cnn_size,
+                                container.encoder.embedding_dim),
+                # torch.nn.Sigmoid()
+            ).to(self.device)
+
+        autoencoder_opt = Adam(itertools.chain(self.decoder.parameters(),
+                                               self.ae_conditioner.parameters(),
+                                               self.projector.parameters()),
+                               lr=1e-3)
+
+        x_plot, y_plot = None, None
+        first_plotted = False
 
         container.current_task.set_labels_type('dataset')
         container.current_task.train()
-
-        hooks = []
-        for n, m in itertools.chain(self.decoder.named_modules(), container.encoder.named_modules()):
-            if isinstance(m, torch.nn.ReLU):  # or isinstance(m, torch.nn.Conv2d):
-                hooks.append(Hook(m))
-
-        # _, x_plot, y_plot = container.current_task.sample(size=self.train_batch_size)
-        x_plot = None
-        first_plotted = False
-
-        for e in range(self.autoencoder_epochs):
-            if self.plot_dir is not None and (e % self.plot_step == 0 or e + 1 == self.autoencoder_epochs):
-                if x_plot is not None:
-                    if not first_plotted:
-                        f = torchvision.utils.make_grid(x_plot.cpu(), scale_each=True).numpy()
-                        f = plt.imshow(np.transpose(f, (1, 2, 0)), interpolation='nearest')
-                        f.figure.savefig(os.path.join(self.plot_dir, 'images_task{}.png'
-                                                      .format(container.current_task.index)))
-                        first_plotted = True
-
-                    f = self.plot_rec(x_plot, container)
-                    f.savefig(os.path.join(self.plot_dir, 'images_rec_task{}_{}.png'
-                                           .format(container.current_task.index,
-                                                   e if not e + 1 == self.autoencoder_epochs else 'final')))
-
-            for i, (_, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-                self.decoder.train()
-                container.encoder.train()
-
-                if container.current_task.index > 0 and self.reg_type != 'alternation':
-                    old_images, old_labels, old_embeddings = self.get_sampled_images(images.size(0))
-
-                    emb = container.encoder(old_images)
-                    dis_reg = torch.sub(1.0, torch.nn.functional.cosine_similarity(torch.flatten(emb, 1),
-                                                                                   torch.flatten(old_embeddings, 1),
-                                                                                   dim=-1))
-                    dis_reg = dis_reg.mean() * self.er
-
-                    images, labels = self.combine_batches(images, old_images, labels, old_labels)
-                else:
-                    dis_reg = 0
-
-                if i == 0 and e == 0:
-                    x_plot = images
-
-                emb = container.encoder(images)
-
-                x_rec = self.decoder(emb)
-
-                assert not torch.isnan(images).any(), 'Sampled Images NaN'
-                assert not torch.isnan(emb).any(), 'Emb NaN'
-                assert not torch.isnan(x_rec).any(), 'X_rec NaN'
-
-                if self.ae_conditioned:
-                    pred = self.autoencoder_classifier(torch.flatten(emb, 1))
-
-                    cross_entropy = torch.nn.functional.cross_entropy(pred,
-                                                                      labels.long(), reduction='none')
-                    cross_entropy = cross_entropy.mean()
-                    cross_entropy *= self.cew
-                else:
-                    cross_entropy = 0
-
-                rec_loss = self.rec_loss(x_rec, images, reduction='mean')
-
-                l1_loss = torch.tensor(0.0, dtype=torch.float, device=self.device)
-                for h in hooks:
-                    l1_loss += torch.abs(h.output).mean()
-
-                loss = rec_loss + cross_entropy + dis_reg + l1_loss * self.l1
-
-                if container.current_task.index > 0 and self.reg_type == 'alternation':
-                    images, labels, old_embeddings = self.get_sampled_images(emb.size(0))
-
-                    emb = container.encoder(images)
-                    x_rec = self.decoder(emb)
-
-                    if self.ae_conditioned:
-                        pred = self.autoencoder_classifier(torch.flatten(emb, 1))
-
-                        cross_entropy = torch.nn.functional.cross_entropy(pred,
-                                                                          labels.long(), reduction='none')
-                        cross_entropy = cross_entropy.mean()
-                        cross_entropy *= self.cew
-                    else:
-                        cross_entropy = 0
-
-                    dis_reg = torch.sub(1.0, torch.nn.functional.cosine_similarity(torch.flatten(emb, 1),
-                                                                                   torch.flatten(old_embeddings, 1),
-                                                                                   dim=-1))
-
-                    dis_reg = dis_reg.mean()
-
-                    rec_loss = self.rec_loss(x_rec, images)
-
-                    old_loss = rec_loss + cross_entropy + dis_reg * self.er
-
-                    loss = (1 - self.old_w) * loss + self.old_w * old_loss
-
-                autoencoder_opt.zero_grad()
-                loss.backward()
-                autoencoder_opt.step()
-
-        for h in hooks:
-            h.close()
-
-        for param in container.encoder.parameters():
-            param.requires_grad = False
-
-    def nf_training(self, container: Container):
-
-        self.generator = self.get_generator()
-        container.encoder.eval()
-
-        parameters = list(self.generator.parameters())
-        if self.conditioner is not None:
-            parameters.extend(list(self.conditioner.parameters()))
-
-        if self.ae_conditioned and self.conditioner_fine_tuning:
-            conditioner_fine_tuning_opt = torch.optim.Adam(list(self.autoencoder_classifier.trainable_parameters()),
-                                                           lr=1e-4)
-
-        inn_optimizer = torch.optim.Adam(parameters, lr=self.nf_lr,
-                                         weight_decay=self.nf_weight_decay)
-
-        container.current_task.set_labels_type('dataset')
-
-        if False:
-            with torch.no_grad():
-                indexes = []
-                losses = []
-                self.decoder.train()
-                container.encoder.train()
-
-                for _, (i, images, labels) in enumerate(container.current_task(self.train_batch_size)):
-                    emb = container.encoder(images)
-
-                    x_rec = self.decoder(emb)
-
-                    pred = self.autoencoder_classifier(torch.flatten(emb, 1))
-                    cross_entropy = torch.nn.functional.cross_entropy(pred,
-                                                                      labels.long(), reduction='none')
-                    cross_entropy *= self.cew
-                    rec_loss = self.rec_loss(x_rec, images, reduction='none').view(cross_entropy.size(0), -1).sum(1)
-
-                    loss = cross_entropy + rec_loss
-
-                    losses.extend(loss)
-                    indexes.extend(i)
-
-                # sort desc
-                # prendo indici ed estraggo gli indici veri
-                # faccio un sampling del sottoinsieme
-
-                losses = torch.stack(losses).tolist()
-
-                values = zip(losses, indexes)
-                values = sorted(values, key=lambda x: x[0], reverse=True)
-                losses, indexes = zip(*values)
-                # indexes = indexes[self.subset_size]
-
-                indexes = indexes[5000:]
-                # indexes = torch.tensor(indexes, device=self.device)
-
-                data_to_iter = container.current_task(self.train_batch_size,
-                                                      sampler=torch.utils.data.SubsetRandomSampler(indexes))
-        else:
-            data_to_iter = container.current_task(self.train_batch_size)
-
-        best_model_dict = (None, None)
-        best_loss = np.inf
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(inn_optimizer, mode='min', factor=0.8,
-                                                               patience=self.tolerance // 3 if self.tolerance_training
-                                                               else self.generator_epochs // 10,
-                                                               verbose=True,
-                                                               threshold=0.01, threshold_mode='rel', cooldown=0,
-                                                               min_lr=0.00001,
-                                                               eps=1e-08)
-
-        u_to_sample = self.prior.sample(100).to(self.device)
 
         if self.tolerance_training:
             it = itertools.count(start=0, step=1)
             assert self.tolerance > 0
             ctol = self.tolerance
         else:
+            ctol = -1
+            it = range(self.autoencoder_epochs)
+
+        best_loss = np.inf
+        best_model = (None, None)
+
+        ae_bar = tqdm(it, desc='AE training', leave=False)
+        for e in ae_bar:
+            if self.plot_dir is not None and (
+                    e % self.plot_step == 0 or e + 1 == self.autoencoder_epochs):
+                if x_plot is not None:
+                    f = self.plot_rec(x_plot, container, y_plot)
+                    f.savefig(
+                        os.path.join(self.plot_dir, 'images_rec_task{}_{}.png'
+                                     .format(container.current_task.index,
+                                             e if not e + 1 == self.autoencoder_epochs else 'final')))
+            tot_loss = []
+
+            for i, (images, labels) in enumerate(dataset):
+                # images = images.float()
+
+                # if i == e == 0:
+                #     print(images.max(), images.min())
+
+                self.decoder.train()
+                self.ae_conditioner.train()
+                container.encoder.train()
+                self.projector.train()
+
+                # if container.current_task.index > 0 and self.reg_type != 'alternation':
+                #     with torch.no_grad():
+                #         old_images, old_labels, _, _ = self.get_sampled_images(
+                #             images.size(0))
+                #         images, labels = self.combine_batches(images,
+                #                                               old_images,
+                #                                               labels,
+                #                                               old_labels)
+                # f = torchvision.utils.make_grid(images.cpu(),
+                #                                 scale_each=True,
+                #                                 range=(0, 1)).numpy()
+                # f = plt.imshow(np.transpose(f, (1, 2, 0)),
+                #                interpolation='nearest')
+                # plt.show()
+
+                if i == 0 and e == 0:
+                    x_plot, y_plot = images, labels
+                    f = torchvision.utils.make_grid(x_plot.cpu(),
+                                                    scale_each=False,
+                                                    range=(0, 1)).numpy()
+                    f = plt.imshow(np.transpose(f, (1, 2, 0)),
+                                   interpolation='nearest')
+                    f.figure.savefig(
+                        os.path.join(self.plot_dir, 'images_task{}.png'
+                                     .format(container.current_task.index)))
+
+                emb = container.encoder.flatten_cnn(images)
+                emb = self.projector(emb)
+
+                x_rec = self.decoder(emb, y=self.ae_conditioner(labels.long()))
+                rec_loss = self.rec_loss(x_rec, images, reduction='none')
+
+                tot_loss.extend(rec_loss.tolist())
+
+                loss = rec_loss.mean()
+
+                autoencoder_opt.zero_grad()
+                loss.backward()
+                autoencoder_opt.step()
+
+                ae_bar.set_postfix(posfix)
+
+            tot_loss = np.mean(tot_loss)
+            if tot_loss < best_loss:
+                best_loss = tot_loss
+                best_model = (self.decoder.state_dict(),
+                              self.projector.state_dict())
+                ctol = self.tolerance
+            else:
+                ctol -= 1
+                if ctol <= 0 and self.tolerance_training:
+                    break
+
+            posfix.update({'tot_loss': tot_loss, 'tolerance': ctol})
+
+        self.decoder.load_state_dict(best_model[0])
+        self.projector.load_state_dict(best_model[1])
+
+    def nf_training(self, container: Container):
+        container.current_task.train()
+        container.current_task.set_labels_type('dataset')
+        container.encoder.eval()
+        self.nf_conditioner.eval()
+        self.ae_conditioner.eval()
+
+        embs = []
+        labels = []
+
+        with torch.no_grad():
+            for i, (_, images, y) in enumerate(
+                    container.current_task(self.ae_batch_size)):
+                emb = container.encoder.flatten_cnn(images)
+                emb = self.projector(emb)
+                embs.append(emb)
+                labels.append(y.long())
+
+            for old_dataset in self.old_datasets:
+                # if len(self.old_dataset_labels) > 0:
+                d = len(embs)
+                for images, y in DataLoader(old_dataset,
+                                  batch_size=self.nf_batch_size, shuffle=True):
+                    # images, y, _ = self.sample(d, labels=[i])
+                    _embs = container.encoder.flatten_cnn(images)
+                    _embs = self.projector(_embs)
+                    # for _emb, _y in zip(_embs, y):
+                    embs.append(_embs)
+                    labels.append(y)
+                    # im, lb, nfemb = self.sample(d, labels=[i])
+                    # emb = container.encoder.flatten_cnn(im)
+                    # emb = self.projector(emb)
+                    #
+                    # embs.extend(emb)
+                    # labels.append(lb)
+
+            embs = torch.cat(embs, 0)
+            labels = torch.cat(labels, 0)
+
+            # if self.sampled_images_memory is not None:
+            #     cat = torch.cat((embs, self.sampled_images_memory.tensors[2].to(
+            #         self.device)), 0)
+            #     mn = cat.mean(0)
+            #     std = cat.std(0)
+            # else:
+            mn = embs.mean(0).clone().detach()
+            std = embs.std(0).clone().detach()
+
+            self.generator.set_mean_std(mn, std)
+        #
+        data_to_iter = DataLoader(TensorDataset(embs, labels),
+                                  batch_size=self.nf_batch_size, shuffle=True)
+
+        if self.reset_nf:
+            self.generator = self.get_generator()
+
+        inn_optimizer = torch.optim.Adam(
+            itertools.chain(self.generator.parameters(),
+                            self.nf_conditioner.parameters()),
+            lr=self.nf_lr,
+            weight_decay=self.nf_weight_decay)
+
+        best_model_dict = (None, None)
+        best_loss = np.inf
+        scheduler = None
+
+        if self.anneal_lr:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                inn_optimizer, mode='min', factor=0.8,
+                patience=self.tolerance // 3 if self.tolerance_training
+                else self.generator_epochs // 10,
+                verbose=False,
+                threshold=0.01, threshold_mode='rel', cooldown=0,
+                min_lr=0.00001,
+                eps=1e-08)
+
+        u_to_sample = self.prior.sample(100).to(self.device)
+
+        labels = self.dataset_labels
+        probs = torch.zeros(max(labels) + 1, device=self.device)
+        for i in labels:
+            probs[i] = 1
+
+        m = Categorical(probs)
+        y_to_sample = m.sample(torch.Size([u_to_sample.size(0)])).long()
+
+        if self.tolerance_training:
+            it = itertools.count(start=0, step=1)
+            assert self.tolerance > 0
+            ctol = self.tolerance
+        else:
+            ctol = -1
             it = range(self.generator_epochs)
 
-        for e in it:
-            if self.plot_dir is not None and (e % self.plot_step == 0 or e + 1 == self.generator_epochs):
-                f = self.plot(u=u_to_sample)
+        # data_to_iter1 = DataLoader(TensorDataset(embs, labels), batch_size=self.nf_batch_size * 4, shuffle=True)
+        # u, log_det = self.generator(emb, y=self.nf_conditioner(labels))
+        # emb, labels = self.combine_batches(emb, old_nf_emb, labels, old_labels)
+
+        nf_bar = tqdm(it, desc='NF training', leave=False)
+        for e in nf_bar:
+
+            if self.tolerance_training and e > self.tolerance_cap:
+                break
+
+            if self.plot_dir is not None \
+                    and (e % self.plot_step == 0 or (
+                    e + 1 == self.generator_epochs and not self.tolerance_training)):
+                f = self.plot(u=u_to_sample, y=y_to_sample)
                 f.savefig(os.path.join(self.plot_dir, 'sampled_task{}_{}.png'
                                        .format(container.current_task.index,
-                                               e if not e + 1 == self.generator_epochs or self.tolerance_training
-                                               else 'final')))
-                self.calculate_score(container)
+                                               e)))
 
-            cum_loss = 0
+            losses = []
 
-            for i, (_, images, labels) in enumerate(data_to_iter):
-                with torch.no_grad():
-                    emb = container.encoder(images)
-
-                if container.current_task.index > 0 and self.reg_type != 'alternation':
-                    old_images, old_labels, old_emb = self.get_sampled_images(emb.size(0))
-                    emb, labels = self.combine_batches(emb, old_emb, labels, old_labels)
-
-                self.generator.train()
+            for i, (emb, labels) in enumerate(data_to_iter):
+                # with torch.no_grad():
+                #     if container.current_task.index > 0:
+                #         images, old_labels, _, _ = self.get_sampled_images(
+                #             emb.size(0))
+                #         old_nf_emb = container.encoder.flatten_cnn(images)
+                #         old_nf_emb = self.projector(old_nf_emb)
+                #         emb, labels = self.combine_batches(emb, old_nf_emb,
+                #                                            labels, old_labels)
+                container.encoder.eval()
                 self.prior.train()
+                self.nf_conditioner.train()
 
-                if self.conditioner is not None:
-                    self.conditioner.train()
-                    u, log_det = self.generator(emb, y=self.conditioner(labels.long()))
-                else:
-                    u, log_det = self.generator(emb)
+                u, log_det = self.generator(emb, y=self.nf_conditioner(labels))
 
                 if len(log_det.shape) > 1:
                     log_det = log_det.sum(1)
@@ -462,189 +598,145 @@ class PRER(NaiveMethod):
                 log_prob = self.prior.log_prob(u)
                 log_prob = torch.flatten(log_prob, 1).sum(1)
 
-                loss = -torch.mean(log_prob + log_det)
+                loss = -(log_prob + log_det)
 
-                if self.ae_conditioned and self.conditioner_fine_tuning:
-                    self.autoencoder_classifier.train()
-                    pred = self.autoencoder_classifier(torch.flatten(emb.detach(), 1))
-                    cross_entropy = torch.nn.functional.cross_entropy(pred, labels.long(), reduction='mean')
-                    loss += cross_entropy
+                losses.extend(loss.tolist())
 
-                if container.current_task.index > 0 and self.reg_type == 'alternation':
-                    with torch.no_grad():
-
-                        images, labels, old_embeddings = self.get_sampled_images(emb.size(0))
-                        emb = container.encoder(images)
-
-                    # u, log_det = self.generator(emb.detach(), y=self.conditioner(labels.long()))
-                    u, log_det = self.generator(emb.detach())
-
-                    if len(log_det.shape) > 1:
-                        log_det = log_det.sum(1)
-
-                    log_prob = self.prior.log_prob(u)
-                    log_prob = torch.flatten(log_prob, 1).sum(1)
-
-                    old_loss = -torch.mean(log_prob + log_det)
-
-                    loss = (1 - self.old_w) * loss + self.old_w * old_loss
-
-                cum_loss += loss.item()
+                loss = torch.mean(loss)
 
                 inn_optimizer.zero_grad()
-                if self.ae_conditioned and self.conditioner_fine_tuning:
-                    conditioner_fine_tuning_opt.zero_grad()
                 loss.backward()
-                if self.ae_conditioned and self.conditioner_fine_tuning:
-                    conditioner_fine_tuning_opt.step()
+                #torch.nn.utils.clip_grad_norm_(self.generator.parameters(),
+                 #                              25)
                 inn_optimizer.step()
 
-            cum_loss /= (i + 1)
+            mean_loss = np.mean(losses)
 
-            if cum_loss < best_loss:
-                best_loss = cum_loss
+            if mean_loss < best_loss:
+                best_loss = mean_loss
                 best_model_dict = (self.generator.state_dict(),
-                                   self.conditioner.state_dict() if self.conditioner is not None else None)
+                                   self.nf_conditioner.state_dict())
                 ctol = self.tolerance
             else:
                 ctol -= 1
                 if ctol <= 0 and self.tolerance_training:
                     break
 
-            scheduler.step(cum_loss)
+            nf_bar.set_postfix(
+                {'ctol': ctol, 'best_loss': best_loss, 'loss': mean_loss})
 
-        self.calculate_score(container)
+            if scheduler is not None:
+                scheduler.step(mean_loss)
 
         self.generator.load_state_dict(best_model_dict[0])
-        if self.conditioner is not None:
-            self.conditioner.load_state_dict(best_model_dict[1])
+        self.nf_conditioner.load_state_dict(best_model_dict[1])
 
         if self.plot_dir is not None:
             f = self.plot(u=u_to_sample)
-            f.savefig(os.path.join(self.plot_dir, 'best_model_task{}.png'.format(container.current_task.index)))
+            f.savefig(os.path.join(self.plot_dir,
+                                   'best_model_task{}.png'.format(
+                                       container.current_task.index)))
 
         container.current_task.set_labels_type('task')
 
-    def calculate_score(self, container):
-        true_labels = []
-        predicted_labels = []
-
-        for j, x, y in container.current_task:
-            true_labels.extend(y.tolist())
-            emb = container.encoder(x)
-            a = self.autoencoder_classifier(emb)
-            predicted_labels.extend(a.max(dim=1)[1].tolist())
-
-        a, b = np.asarray(true_labels), np.asarray(predicted_labels)
-        print((a == b).sum() / len(a))
-
     def combine_batches(self, xa, xb, ya, yb, zero_prob: float = None):
-        if self.reg_type == 'concatenation':
-            return torch.cat((xa, xb), 0), torch.cat((ya, yb), 0)
-        else:
-            assert xa.size() == xb.size(), '{} <> {}'.format(xa.size(), xb.size())
+        assert xa.size() == xb.size(), '{} <> {}'.format(xa.size(), xb.size())
 
-            if zero_prob is None:
-                zero_prob = 1 - len(self.old_labels) / (len(self.all_labels))
+        if zero_prob is None:
+            zero_prob = 1 - len(self.old_dataset_labels) / (
+                len(self.dataset_labels))
 
-            batch_size = xa.size(0)
-            mask = torch.distributions.binomial.Binomial(probs=zero_prob).sample((batch_size,)).to(self.device)
+        batch_size = xa.size(0)
+        mask = torch.distributions.binomial.Binomial(probs=zero_prob).sample(
+            (batch_size,)).to(self.device)
 
-            x_mask = mask.clone()
-            for i in range(len(xa.shape[1:])):
-                x_mask.unsqueeze_(-1)
+        x_mask = mask.clone()
+        for i in range(len(xa.shape[1:])):
+            x_mask.unsqueeze_(-1)
 
-            x = xa * x_mask + xb * (1 - x_mask)
-            y = ya * mask + yb.long() * (1 - mask)
+        x = xa * x_mask + xb * (1 - x_mask)
+        y = ya * mask + yb.long() * (1 - mask)
+        y = y.long()
+
+        return x, y
+
+    def sample(self, size, labels=None, y=None, u=None):
+
+        self.generator.eval()
+        self.prior.eval()
+        self.decoder.eval()
+        self.ae_conditioner.eval()
+        self.nf_conditioner.eval()
+
+        if u is None:
+            u = self.prior.sample(size)
+
+        if isinstance(labels, torch.Tensor):
+            y = labels
+
+        if y is None and labels is not None:
+            probs = torch.zeros(max(labels) + 1, device=self.device)
+            for i in labels:
+                probs[i] = 1
+
+            m = Categorical(probs)
+            y = m.sample(torch.Size([u.size(0)]))
             y = y.long()
 
-            return x, y
+        embs, _ = self.generator.backward(u, y=self.nf_conditioner(y))
 
-    def generate_conditioned_batch(self, size, reconstructor, generative_model, labels, conditioner, prior, u=None):
-        reconstructor.eval()
+        x = self.decoder(embs, y=self.ae_conditioner(y))
 
-        generative_model.eval()
-        conditioner.eval()
-        prior.eval()
-
-        probs = torch.zeros(max(labels) + 1, device=self.device)
-        for i in labels:
-            probs[i] = 1
-
-        m = Categorical(probs)
-        y = m.sample(torch.Size([size]))
-        y_cond = conditioner(y)
-        y = y.long()
-        if u is None:
-            u = prior.sample(size)
-        # else:
-        #     assert u.size(0) == size
-        embs, _ = generative_model.backward(u, y=y_cond)
-
-        z = reconstructor(embs)
-
-        return z, y, embs
-
-    def generate_predicted_batch(self, size, reconstructor, generative_model, predicter, prior, u=None):
-        reconstructor.eval()
-        predicter.eval()
-
-        generative_model.eval()
-        prior.eval()
-
-        if u is None:
-            u = prior.sample(size)
-        # else:
-        #     assert u.size(0) == size
-        embs, _ = generative_model.backward(u, y=None)
-
-        pred = predicter(embs)
-        y = pred.max(dim=1)[1]
-        y = y.long()
-
-        z = reconstructor(embs)
-
-        return z, y, embs
+        # assert y is not None
+        return x, y, embs
 
     @torch.no_grad()
+    def generate_images_memory(self, encoder):
+
+        fixed_replay = self.fixed_replay
+
+        images = []
+        labels = []
+        nf_embeddings = []
+        classification_embeddings = []
+
+        while fixed_replay > 0:
+            im, lb, nfemb = self.sample(min(self.nf_batch_size, fixed_replay),
+                                        labels=self.old_dataset_labels)
+            cemb = encoder(im)
+
+            images.append(im.cpu())
+            labels.append(lb.cpu())
+            nf_embeddings.append(nfemb.cpu())
+            classification_embeddings.append(cemb.cpu())
+
+            fixed_replay -= self.nf_batch_size
+
+        images, labels, nf_embeddings, classification_embeddings = \
+            torch.cat(images), torch.cat(labels), torch.cat(
+                nf_embeddings), torch.cat(classification_embeddings)
+
+        self.sampled_images_memory = TensorDataset(images, labels,
+                                                   nf_embeddings,
+                                                   classification_embeddings)
+
+    # @torch.no_grad()
     def get_sampled_images(self, size: int):
-        if self.fixed_replay:
-            if self.sampled_images_memory is None:
-                if self.conditioner is None:
-                    images, labels, old_embeddings = self.generate_predicted_batch(self.fixed_replay, self.decoder,
-                                                                                   self.generator,
-                                                                                   self.autoencoder_classifier,
-                                                                                   self.prior)
-                else:
-                    images, labels, old_embeddings = self.generate_conditioned_batch(self.fixed_replay, self.decoder,
-                                                                                     self.generator,
-                                                                                     self.old_labels, self.conditioner,
-                                                                                     self.prior)
+        if size is None:
+            size = len(self.sampled_images_memory)
 
-                self.sampled_images_memory = TensorDataset(images, labels, old_embeddings)
+        indices = torch.randperm(len(self.sampled_images_memory))[:size]
 
-            indices = torch.randperm(len(self.sampled_images_memory))[:size]
+        images, labels, nf_embeddings, encoder_embeddings = \
+            self.sampled_images_memory[indices]
 
-            images, labels, old_embeddings = self.sampled_images_memory[indices]
-
-            return images, labels, old_embeddings
-        else:
-            if self.conditioner is None:
-                images, labels, old_embeddings = self.generate_predicted_batch(size, self.old_decoder,
-                                                                               self.old_generator,
-                                                                               self.autoencoder_classifier, self.prior)
-            else:
-                images, labels, old_embeddings = self.generate_conditioned_batch(size, self.old_decoder,
-                                                                                 self.old_generator,
-                                                                                 self.old_labels, self.old_conditioner,
-                                                                                 self.prior)
-
-            return images, labels, old_embeddings
+        return images.to(self.device), labels.to(self.device), \
+               nf_embeddings.to(self.device), encoder_embeddings.to(self.device)
 
     def on_task_starts(self, container: Container, *args, **kwargs):
 
         self.sampled_images_memory = None
-        self.all_labels.extend(container.current_task.task_labels)
+        self.dataset_labels.extend(container.current_task.dataset_labels)
 
         dl = np.zeros(len(container.current_task.dataset_labels), dtype=int)
 
@@ -653,78 +745,104 @@ class PRER(NaiveMethod):
 
         dl = torch.tensor(dl, device=self.device, dtype=torch.long)
 
-        for n, m in itertools.chain(self.decoder.named_modules(), container.encoder.named_modules()):
-            if isinstance(m, torch.nn.ReLU):  # or isinstance(m, torch.nn.Conv2d):
-                self.hooks.append(Hook(m))
-
         self._t2d[container.current_task.index] = dl
 
         for k, v in container.current_task.d2t.items():
             self._d2t[k] = torch.tensor(v, dtype=torch.long, device=self.device)
 
-        self.autoencoder_training(container)
-
-        for h in self.hooks:
-            h.close()
+        # container.encoder.classification()
+        if container.current_task.index > 0:
+            self.generate_images_memory(container.encoder)
 
     def on_task_ends(self, container: Container, *args, **kwargs):
 
         plt.close('all')
+
+        # with autograd.detect_anomaly():
+            #     pass
+        self.autoencoder_training(container)
         self.nf_training(container)
 
-        self.old_labels.extend(container.current_task.dataset_labels)
+        with torch.no_grad():
+            labels = container.current_task.dataset_labels
+            labels_proportions = len(container.current_task) // len(labels)
+
+            for i in container.current_task.dataset_labels:
+                old_images, old_labels = [], []
+                images, y, _ = self.sample(labels_proportions, labels=[i])
+
+                # nans = torch.isnan(images).sum()
+                indexes = torch.any(torch.flatten(torch.isnan(images), 1), 1)
+                nans = indexes.sum()
+                if nans > 0:
+                    print('Nans', nans)
+                    assert nans < (labels_proportions * 0.5), nans
+                    images = images[~indexes]
+                    y = y[~indexes]
+
+                old_images.append(images)
+                old_labels.append(y)
+
+                old_images = torch.cat(old_images, 0)
+                old_labels = torch.cat(old_labels, 0).long()
+                old_images[old_images < 1e-10] = 0
+
+                old_dataset = TensorDataset(old_images, old_labels)
+                self.old_datasets.append(old_dataset)
+
+        self.old_dataset_labels.extend(container.current_task.dataset_labels)
         self.task_labels.append(container.current_task.dataset_labels)
         self.sampled_images_memory = None
+        self.past_encoder = deepcopy(container.encoder)
 
-        if not self.fixed_replay:
-            self.old_generator = self.get_generator().to(self.device)
-            self.old_generator.load_state_dict(self.generator.state_dict())
-            self.old_conditioner = deepcopy(self.conditioner)
-            self.old_generator.eval()
-
-            self.old_decoder = deepcopy(self.decoder)
-            self.old_decoder.load_state_dict(self.decoder.state_dict())
-            self.old_decoder.eval()
-
-    def plot(self, labels=None, n=100, u=None):
+    def plot(self, labels=None, size=100, y=None, u=None):
         if labels is None:
-            labels = []
-            for tl in self.task_labels:
-                labels.extend(tl)
+            labels = self.dataset_labels
 
         labels.sort()
-        # sample_n = 10
+
+        if u is not None:
+            size = u.size(0)
 
         with torch.no_grad():
-            self.generator.eval()
-            self.decoder.eval()
+            probs = torch.zeros(max(labels) + 1, device=self.device)
+            for i in labels:
+                probs[i] = 1
 
-            if self.conditioner is not None:
-                x, _, _ = self.generate_conditioned_batch(n, self.decoder, self.generator, labels, self.conditioner,
-                                                          self.prior, u)
-            else:
-                x, _, _ = self.generate_predicted_batch(n, self.decoder, self.generator, self.autoencoder_classifier,
-                                                        self.prior, u)
+            if y is None:
+                m = Categorical(probs)
+                y = m.sample(torch.Size([u.size(0)]))
+                y = y.long()
 
-            f = torchvision.utils.make_grid(x.cpu(), scale_each=True, ).numpy()
+            x, _, _ = self.sample(size, y=y, u=u)
+
+            f = torchvision.utils.make_grid(x.cpu(), scale_each=False,
+                                            range=(0, 1)).numpy()
             f = plt.imshow(np.transpose(f, (1, 2, 0)), interpolation='nearest')
 
             return f.figure
 
-    def plot_rec(self, x, container):
+    def plot_rec(self, x, container, y=None):
+        container.encoder.eval()
+        self.decoder.eval()
 
         with torch.no_grad():
-            emb = container.encoder(x)
-            x_rec = self.decoder(emb)
+            emb = container.encoder.flatten_cnn(x)
+            emb = self.projector(emb)
+            x_rec = self.decoder(emb, y=self.ae_conditioner(y.long()))
 
-        f = torchvision.utils.make_grid(x_rec.cpu(), scale_each=True, ).numpy()
+        f = torchvision.utils.make_grid(x_rec.cpu(), scale_each=False,
+                                        range=(0, 1)).numpy()
         f = plt.imshow(np.transpose(f, (1, 2, 0)), interpolation='nearest')
 
         return f.figure
 
     def get_generator(self):
+        cond_size = self.nf_conditioner.size
 
-        gen = RNVP(n_levels=self.levels, levels_blocks=self.blocks, input_dim=self.emb_dim,
-                   n_hidden=self.n_hidden, conditioning_size=0, hidden_size=self.hidden_size)
+        gen = RNVP(n_levels=self.levels, levels_blocks=self.blocks,
+                   input_dim=self.emb_dim,
+                   n_hidden=self.n_hidden, conditioning_size=cond_size,
+                   hidden_size=self.hidden_size)
 
         return gen.to(self.device)

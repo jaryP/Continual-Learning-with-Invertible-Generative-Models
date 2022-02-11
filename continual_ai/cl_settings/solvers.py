@@ -11,8 +11,6 @@ import numpy as np
 import torch
 from torch import nn
 
-# TODO: Creare classe generale solver con: 1) add_task, 2) get_trainable_parameters
-
 
 class Solver(ABC):
 
@@ -70,10 +68,10 @@ class MultiHeadTaskSolver(nn.Module):
 
     def base_topology(self, ind, outd):
         return torch.nn.Sequential(*[torch.nn.Linear(ind, ind),
-                                     torch.nn.Dropout(0.2),
+                                     torch.nn.Dropout(0.5),
                                      torch.nn.ReLU(),
                                      torch.nn.Linear(ind, ind // 4),
-                                     torch.nn.Dropout(0.2),
+                                     torch.nn.Dropout(0.5),
                                      torch.nn.ReLU(),
                                      torch.nn.Linear(ind // 4, outd)])
 
@@ -117,8 +115,10 @@ class MultiHeadTaskSolver(nn.Module):
 
 class SingleIncrementalTaskSolver(nn.Module):
     #TODO: to finish
-    def __init__(self, input_dim, topology: callable = None, flat_input=False):
+    def __init__(self, input_dim, topology: callable = None, flat_input=False, device='cpu'):
         super(SingleIncrementalTaskSolver, self).__init__()
+
+        self.device = device
 
         if topology is None:
             topology = self.base_topology
@@ -145,22 +145,25 @@ class SingleIncrementalTaskSolver(nn.Module):
             self.__net.add_module('flatten', nn.Flatten())
 
         self.__net.add_module('net', net)
+        self.__net.to(self.device)
+
         self.register_buffer('initialization_done', torch.tensor(0))
         self.register_parameter('w', None)
         self.register_parameter('b', None)
 
     def base_topology(self, ind, outd):
-        return torch.nn.Sequential(*[torch.nn.Linear(ind, ind // 2),
+        return torch.nn.Sequential(*[torch.nn.ReLU(),
+                                     torch.nn.Linear(ind, ind),
                                      torch.nn.Dropout(0.2),
                                      torch.nn.ReLU(),
-                                     torch.nn.Linear(ind // 2, ind // 4),
+                                     torch.nn.Linear(ind, ind // 4),
                                      torch.nn.Dropout(0.2),
                                      torch.nn.ReLU(),
                                      torch.nn.Linear(ind // 4, outd)])
 
     def _get_wb(self, in_features, out_features):
-        w = torch.empty(out_features, in_features)
-        b = torch.empty(out_features)
+        w = torch.empty(out_features, in_features, device=self.device)
+        b = torch.empty(out_features, device=self.device)
         torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
         bound = 1 / np.sqrt(in_features)
         torch.nn.init.uniform_(b, -bound, bound)
@@ -171,15 +174,20 @@ class SingleIncrementalTaskSolver(nn.Module):
         if self.initialization_done == 0:
             self.initialization_done += 1
             w, b, = self._get_wb(self.last_layer_dimension, output_size)
-            self.w = torch.nn.Parameter(w, requires_grad=True)
-            self.b = torch.nn.Parameter(b, requires_grad=True)
+            w = torch.nn.Parameter(w, requires_grad=True)
+            b = torch.nn.Parameter(b, requires_grad=True)
         else:
             current_shape = self.w.shape
             w, b, = self._get_wb(self.last_layer_dimension, current_shape[0] + output_size)
             w[:current_shape[0], :current_shape[1]] = self.w.data
             b[:current_shape[0]] = self.b.data
-            self.w = torch.nn.Parameter(w, requires_grad=True)
-            self.b = torch.nn.Parameter(b, requires_grad=True)
+            w = torch.nn.Parameter(w, requires_grad=True)
+            b = torch.nn.Parameter(b, requires_grad=True)
+
+        self.register_parameter('w', w)
+        self.register_parameter('b', b)
+
+        return self
 
     @property
     def task(self):

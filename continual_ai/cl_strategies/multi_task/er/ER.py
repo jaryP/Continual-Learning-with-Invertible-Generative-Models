@@ -37,10 +37,10 @@ class EmbeddingRegularization(NaiveMethod):
 
         self.memorized_task_size = config.get('task_memory_size', 300)
         self.sample_size = min(config.get('sample_size', 100), self.memorized_task_size)
-        self.importance = config.get('penalty_importance', 10)
+        self.importance = config.get('penalty_importance', 1)
         self.distance = config.get('distance', 'cosine')
         # self.supervised = config.get('supervised', True)
-        self.normalize = config.get('normalize', True)
+        self.normalize = config.get('normalize', False)
         self.batch_size = config.get('batch_size', 25)
 
         if random_state is None or isinstance(random_state, int):
@@ -84,6 +84,8 @@ class EmbeddingRegularization(NaiveMethod):
         if len(self.task_memory) > 0:
 
             to_back = []
+            loss = 0
+
             for t in self.task_memory:
 
                 b = Sampler(t, dimension=self.sample_size, replace=False, return_indexes=False)()
@@ -91,6 +93,7 @@ class EmbeddingRegularization(NaiveMethod):
 
                 image = torch.stack(image)
                 embeddings = torch.stack(embeddings)
+                # print(image.shape)
 
                 new_embedding = container.encoder(image)
 
@@ -100,15 +103,19 @@ class EmbeddingRegularization(NaiveMethod):
                 if self.distance == 'euclidean':
                     dist = (embeddings - new_embedding).norm(p=None, dim=1)
                 elif self.distance == 'cosine':
-                    cosine = torch.nn.functional.cosine_similarity(embeddings, new_embedding)
+                    cosine = torch.nn.functional.cosine_similarity(embeddings, new_embedding, dim=1)
                     dist = 1 - cosine
+                else:
+                    assert False
 
-                to_back.append(dist)
+                # to_back.append(dist)
 
-            to_back = torch.cat(to_back)
+                loss += dist.mean() * self.importance
 
-            container.current_loss += torch.mul(to_back.mean(), self.importance)
-
+            # to_back = torch.cat(to_back)
+            # loss *= self.importance
+            # container.current_loss += torch.mul(to_back.mean(), self.importance)
+            container.current_loss += loss
 
 # class _EmbeddingReguralization(NaiveMethod):
 #     def __init__(self, model: torch.nn.Module, **kwargs):
